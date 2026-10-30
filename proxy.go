@@ -72,8 +72,10 @@ func (ri *reqInfo) finish() {
 		if ri.sent > 0 {
 			ri.rec["resp_bytes"] = ri.sent
 		}
-		if ri.fix != nil && (ri.fix.ThinkingDropped > 0 || ri.fix.StopFixed > 0) {
-			ri.rec["stream_fixes"] = map[string]int{"thinking_dropped": ri.fix.ThinkingDropped, "stop_reason_fixed": ri.fix.StopFixed}
+		if ri.fix != nil {
+			if c := ri.fix.counts(); len(c) > 0 {
+				ri.rec["stream_fixes"] = c
+			}
 		}
 		ri.rec["ms"] = time.Since(ri.start).Milliseconds()
 		ri.g.log.write(ri.rec)
