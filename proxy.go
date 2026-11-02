@@ -21,6 +21,7 @@ type config struct {
 	host, anthropic, litellm, litellmKey, logPath, mimirURL, mimirKey string
 	port                                                              int
 	prefix                                                            []string
+	effort                                                            map[string]string // request model -> reasoning effort sent to Mimir
 }
 
 type gateway struct {
@@ -343,12 +344,15 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ri.finish()
 			return
 		}
-		if shaped, info, err := shapeMimirBody(src); err != nil {
+		if shaped, info, err := shapeMimirBody(src, g.cfg.effort[model]); err != nil {
 			ri.rec["shape_error"] = err.Error() // forward as received and let Mimir answer
 		} else {
 			body = shaped
 			if s2 := sniff(body, ""); s2 != nil {
 				shape = s2
+			}
+			if info.Effort != "" {
+				ri.rec["effort"] = info.Effort
 			}
 			ri.rec["folded"], ri.rec["dropped_fields"], ri.rec["dropped_blocks"], ri.rec["hoisted"] = info.Folded, info.Dropped, info.DroppedBlocks, info.Hoisted
 		}

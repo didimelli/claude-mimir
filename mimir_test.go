@@ -27,7 +27,7 @@ const sampleBody = `{"model":"cubbit/mimir-pro","max_tokens":32000,"stream":true
   {"role":"system","content":"MCP needs auth"}]}`
 
 func TestShapeMimirBody(t *testing.T) {
-	out, info, err := shapeMimirBody([]byte(sampleBody))
+	out, info, err := shapeMimirBody([]byte(sampleBody), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,12 +72,12 @@ func compact(t *testing.T, raw json.RawMessage) []byte {
 
 func TestShapeMimirBodyErrors(t *testing.T) {
 	for _, bad := range []string{`{nope`, `{"messages":"x"}`, `{"messages":[1]}`} {
-		if _, _, err := shapeMimirBody([]byte(bad)); err == nil {
+		if _, _, err := shapeMimirBody([]byte(bad), ""); err == nil {
 			t.Errorf("%s: want an error", bad)
 		}
 	}
 	// no messages at all is fine: nothing to fold
-	if _, _, err := shapeMimirBody([]byte(`{"model":"x"}`)); err != nil {
+	if _, _, err := shapeMimirBody([]byte(`{"model":"x"}`), ""); err != nil {
 		t.Errorf("no messages: %v", err)
 	}
 }
@@ -129,5 +129,44 @@ func TestRewriteMimirError(t *testing.T) {
 func TestEstimateTokens(t *testing.T) {
 	if estimateTokens(nil) != 1 || estimateTokens(make([]byte, 4000)) != 1000 {
 		t.Fatal("estimate")
+	}
+}
+
+func TestShapeMimirBodyPinsEffort(t *testing.T) {
+	out, info, err := shapeMimirBody([]byte(sampleBody), "high")
+	if err != nil {
+		t.Fatal(err)
+	}
+	top := topOf(t, out)
+	if string(top["thinking"]) != `{"type":"adaptive"}` || string(top["output_config"]) != `{"effort":"high"}` {
+		t.Errorf("thinking %s output_config %s", top["thinking"], top["output_config"])
+	}
+	if info.Effort != "high" {
+		t.Errorf("effort %q", info.Effort)
+	}
+	if _, ok := top["metadata"]; ok {
+		t.Errorf("metadata forwarded")
+	}
+	// Claude Code asked for other values: the configured effort replaces them, and the rest of the body is as before.
+	in := strings.Replace(sampleBody, `"effort":"high"`, `"effort":"medium"`, 1)
+	out, _, _ = shapeMimirBody([]byte(in), "low")
+	if got := string(topOf(t, out)["output_config"]); got != `{"effort":"low"}` {
+		t.Errorf("output_config %s", got)
+	}
+	// A request without thinking fields gets them too.
+	out, _, _ = shapeMimirBody([]byte(`{"model":"cubbit/mimir-pro","messages":[]}`), "high")
+	if got := string(topOf(t, out)["output_config"]); got != `{"effort":"high"}` {
+		t.Errorf("output_config %s", got)
+	}
+}
+
+func TestShapeMimirBodyWithoutEffortDropsReasoningFields(t *testing.T) {
+	out, info, _ := shapeMimirBody([]byte(sampleBody), "")
+	top := topOf(t, out)
+	if _, ok := top["thinking"]; ok {
+		t.Errorf("thinking forwarded")
+	}
+	if _, ok := top["output_config"]; ok || info.Effort != "" {
+		t.Errorf("output_config forwarded or effort set: %q", info.Effort)
 	}
 }

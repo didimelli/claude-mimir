@@ -432,3 +432,43 @@ func TestClaudeStreamIsNeverTouched(t *testing.T) {
 		t.Errorf("a Claude stream was changed")
 	}
 }
+
+func TestGatewaySendsConfiguredEffortPerModel(t *testing.T) {
+	r := newRig(t, nil, nil)
+	r.g.cfg.effort = map[string]string{"cubbit/mimir-pro": "high"}
+	post := func(model string) (map[string]json.RawMessage, map[string]any) {
+		body := strings.Replace(string(convo(true)), "cubbit/mimir-pro", model, 1)
+		r.post(t, "/v1/messages?beta=true", []byte(body))
+		lg := r.logs(t)
+		return topOf(t, r.mimir.last(t).body), lg[len(lg)-1]
+	}
+	top, lg := post("cubbit/mimir-pro")
+	if string(top["thinking"]) != `{"type":"adaptive"}` || string(top["output_config"]) != `{"effort":"high"}` || lg["effort"] != "high" {
+		t.Errorf("pro: thinking %s output_config %s log %v", top["thinking"], top["output_config"], lg["effort"])
+	}
+	top, lg = post("cubbit/mimir-slim")
+	if _, ok := top["thinking"]; ok || lg["effort"] != nil {
+		t.Errorf("slim got thinking or an effort: %s %v", top["thinking"], lg["effort"])
+	}
+}
+
+func TestParseConfigMimirEffort(t *testing.T) {
+	env := func(map[string]string) func(string) string { return func(string) string { return "k" } }
+	cfg, err := parseConfig(nil, env(nil))
+	if err != nil || cfg.effort["cubbit/mimir-pro"] != "high" {
+		t.Fatalf("default: %v %v", cfg.effort, err)
+	}
+	cfg, _ = parseConfig([]string{"--mimir-effort", "cubbit/mimir-pro=low", "--mimir-effort", "cubbit/mimir=high"}, env(nil))
+	if cfg.effort["cubbit/mimir-pro"] != "low" || cfg.effort["cubbit/mimir"] != "high" {
+		t.Errorf("flags: %v", cfg.effort)
+	}
+	cfg, _ = parseConfig([]string{"--mimir-effort", "none"}, env(nil))
+	if len(cfg.effort) != 0 {
+		t.Errorf("none: %v", cfg.effort)
+	}
+	for _, bad := range []string{"cubbit/mimir-pro=turbo", "cubbit/mimir-pro", "=high"} {
+		if _, err := parseConfig([]string{"--mimir-effort", bad}, env(nil)); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+}

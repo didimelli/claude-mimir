@@ -13,16 +13,22 @@ import (
 //   - context_management is a Claude-only feature;
 //   - thinking and output_config are validated per Mimir model and differently for each (slim rejects effort high,
 //     mimir rejects medium, adaptive thinking alone fails on slim), and the LiteLLM path dropped them too.
+//     A model with a configured effort (see mimirEffort) gets both set explicitly instead: left to its default,
+//     mimir-pro sometimes reasons until max_tokens and returns an empty turn.
 var mimirDropFields = []string{"metadata", "context_management", "thinking", "output_config"}
 
 type mimirInfo struct {
 	foldStats
 	Dropped []string
+	Effort  string // reasoning effort sent, "" when none
 }
+
+var validEffort = map[string]bool{"low": true, "medium": true, "high": true, "xhigh": true, "max": true}
 
 // shapeMimirBody makes a Claude Code request acceptable to Mimir's Anthropic-compatible endpoint. Only the fields
 // named above and the system entries inside messages are touched; everything else is forwarded as received.
-func shapeMimirBody(body []byte) ([]byte, mimirInfo, error) {
+// A non-empty effort replaces thinking and output_config with adaptive thinking at that effort.
+func shapeMimirBody(body []byte, effort string) ([]byte, mimirInfo, error) {
 	var info mimirInfo
 	var top map[string]json.RawMessage
 	if err := json.Unmarshal(body, &top); err != nil {
@@ -33,6 +39,11 @@ func shapeMimirBody(body []byte) ([]byte, mimirInfo, error) {
 			delete(top, k)
 			info.Dropped = append(info.Dropped, k)
 		}
+	}
+	if effort != "" {
+		top["thinking"] = json.RawMessage(`{"type":"adaptive"}`)
+		top["output_config"] = marshal(map[string]string{"effort": effort})
+		info.Effort = effort
 	}
 	var raws []json.RawMessage
 	if r, ok := top["messages"]; ok {

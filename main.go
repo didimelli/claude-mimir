@@ -26,6 +26,7 @@ func parseConfig(args []string, getenv func(string) string) (config, error) {
 	var cfg config
 	var prefixes multiFlag
 	mimirURL := ""
+	var efforts multiFlag
 	home, _ := os.UserHomeDir()
 	litellmKey := getenv("IT_LITELLM_KEY")
 	if litellmKey == "" {
@@ -41,12 +42,28 @@ func parseConfig(args []string, getenv func(string) string) (config, error) {
 	fs.Var(&prefixes, "prefix", "model prefix routed to Mimir (default cubbit/)")
 	fs.StringVar(&cfg.logPath, "log", filepath.Join(home, "Library/Logs/it-router.jsonl"), "metadata-only request log")
 	fs.StringVar(&mimirURL, "mimir-url", "", "Mimir's Anthropic-compatible endpoint: send Mimir models there directly, without LiteLLM")
+	fs.Var(&efforts, "mimir-effort", "model=effort sent to Mimir as adaptive thinking (repeatable; 'none' sends nothing; default cubbit/mimir-pro=high)")
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
 	}
 	cfg.prefix = prefixes
 	if len(cfg.prefix) == 0 {
 		cfg.prefix = []string{"cubbit/"}
+	}
+	cfg.effort = map[string]string{"cubbit/mimir-pro": "high"}
+	for _, e := range efforts {
+		if e == "none" {
+			cfg.effort = nil
+			continue
+		}
+		model, level, ok := strings.Cut(e, "=")
+		if !ok || model == "" || !validEffort[level] {
+			return cfg, fmt.Errorf("--mimir-effort %q: want model=low|medium|high|xhigh|max, or none", e)
+		}
+		if cfg.effort == nil {
+			cfg.effort = map[string]string{}
+		}
+		cfg.effort[model] = level
 	}
 	cfg.anthropic, cfg.litellm = strings.TrimRight(cfg.anthropic, "/"), strings.TrimRight(cfg.litellm, "/")
 	if mimirURL != "" {
