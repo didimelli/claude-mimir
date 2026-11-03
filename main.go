@@ -40,7 +40,7 @@ func parseConfig(args []string, getenv func(string) string) (config, error) {
 	}
 	fs.StringVar(&cfg.mimirAPI, "mimir-api", api, "which Mimir API to talk to: anthropic (/anthropic, passthrough) or openai (/v1, translated) (default $MIMIR_API or anthropic)")
 	fs.StringVar(&cfg.mimirURL, "mimir-url", "", "Mimir endpoint for the chosen API (default $MIMIR_ANTHROPIC_URL or $MIMIR_OPENAI_URL)")
-	fs.Var(&efforts, "mimir-effort", "model=effort, the reasoning effort sent to Mimir (repeatable; 'none' alone sends nothing; default cubbit/mimir-pro=high on anthropic, nothing on openai)")
+	fs.Var(&efforts, "mimir-effort", "model=effort, the reasoning effort sent to Mimir (repeatable; 'none' alone sends nothing; default cubbit/mimir-pro=high on anthropic, cubbit/mimir-pro=low on openai)")
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
 	}
@@ -53,7 +53,7 @@ func parseConfig(args []string, getenv func(string) string) (config, error) {
 	switch cfg.mimirAPI {
 	case "anthropic":
 	case "openai":
-		valid, urlVar, cfg.effort = openaiEfforts, "MIMIR_OPENAI_URL", nil
+		valid, urlVar, cfg.effort = openaiEfforts, "MIMIR_OPENAI_URL", map[string]string{"cubbit/mimir-pro": "low"}
 	default:
 		return cfg, fmt.Errorf("--mimir-api %q: want anthropic or openai", cfg.mimirAPI)
 	}

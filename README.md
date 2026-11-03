@@ -135,10 +135,10 @@ Mimir serves the same models on two endpoints, and the gateway can use either (`
 - **`openai`**: the gateway translates each Anthropic Messages request into a Chat Completions request for `/v1`, and the reply (streamed or not) back into the Anthropic format. It writes the Anthropic stream itself, so the stream is well-formed by construction. Token usage is real, and `reasoning_effort` (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) works on every model.
   - Request: the system prompt becomes a system message; mid-conversation system entries are folded as on `/anthropic`; text and images become content parts; `tool_use` blocks become `tool_calls` and `tool_result` blocks become `role: tool` messages; tools, `tool_choice`, `max_tokens`, `stop_sequences`, `temperature` and `top_p` map across.
   - Reply: text deltas, tool calls and their argument fragments become Anthropic blocks in order; `finish_reason` maps to `stop_reason` (`stop` → `end_turn`, `length` → `max_tokens`, `tool_calls` → `tool_use`); reasoning is dropped; errors are converted, with the same rewrites as below.
-  - `--mimir-effort model=effort` sends a reasoning effort; by default none is sent, which is what was measured best.
+  - `--mimir-effort model=effort` sets the reasoning effort per model. The default is `low` for `cubbit/mimir-pro` and nothing for the others. On a deliberately hard probe prompt through the gateway (7 runs each): no effort sent gave 1 runaway, a median of 201 s and up to 14k reasoning chunks; `none` gave 0, 88 s and up to 5.6k; `low` gave 0, 53 s and up to 7.1k.
 - **`anthropic`**: the request goes to `/anthropic` nearly as is, and the gateway repairs what that endpoint gets wrong (the notes below).
 
-Why `openai` exists: on `/anthropic`, `mimir-pro` sometimes reasons until `max_tokens` and returns an empty turn after about 3 minutes, and none of `thinking`, `output_config.effort` or `budget_tokens` stops it. On a probe prompt, 4 of 7 runs did that on `/anthropic`, and 0 of 7 on `/v1`. See issue #4.
+Why `openai` exists: on `/anthropic`, `mimir-pro` sometimes reasons until `max_tokens` and returns an empty turn after about 3 minutes, and none of `thinking`, `output_config.effort` or `budget_tokens` stops it. On a probe prompt, 4 of 7 runs did that on `/anthropic`, and 0 of 7 on `/v1` with effort `low`. See issue #4.
 
 ## Notes on the upstream API
 
