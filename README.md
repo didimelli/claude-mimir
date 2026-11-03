@@ -67,9 +67,11 @@ cp agents/mimir*.md ~/.claude/agents/
 
 | Agent | Model | Use it for |
 |---|---|---|
-| `mimir-pro` | `cubbit/mimir-pro` | hard reasoning, large-context analysis, substantial multi-step work (~900k context) |
-| `mimir` | `cubbit/mimir` | routine delegated work: reading code, summarising, small edits (~900k context) |
-| `mimir-slim` | `cubbit/mimir-slim` | small, fast tasks: lookups, short summaries, quick checks (~229k context) |
+| `mimir-pro` | `cubbit/mimir-pro` | hard reasoning, large-context analysis, substantial multi-step work (1M context) |
+| `mimir` | `cubbit/mimir` | routine delegated work: reading code, summarising, small edits (1M context) |
+| `mimir-slim` | `cubbit/mimir-slim` | small, fast tasks: lookups, short summaries, quick checks (262k context) |
+
+The windows are what Mimir's `/v1` reports (`max_model_len`); `/anthropic` rejects somewhat earlier (about 900k and 229k). Claude Code doesn't know these models, so on its own it assumes 200k and compacts a Mimir subagent there. `claude-mimir` sets `CLAUDE_CODE_MAX_CONTEXT_TOKENS=1048576`, which applies only to model IDs Claude Code doesn't recognise, so Mimir subagents get the full window and Claude models keep theirs. `mimir-slim` overflowing its smaller window is fine: the gateway turns Mimir's rejection into `prompt is too long`, and Claude Code compacts and retries.
 
 A minimal agent definition, for writing your own (`~/.claude/agents/<name>.md`):
 

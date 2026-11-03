@@ -4,5 +4,8 @@
 # to Anthropic untouched; it needs no extra headers.
 # Needs the gateway running: curl -s http://127.0.0.1:4000/router/health
 export ANTHROPIC_BASE_URL=http://127.0.0.1:4000
+# Claude Code assumes 200k for model IDs it does not know and compacts Mimir subagents there. This gives them
+# Mimir's real window (1M for mimir and mimir-pro); it applies only to unrecognised IDs, never to Claude models.
+export CLAUDE_CODE_MAX_CONTEXT_TOKENS=${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-1048576}
 unset ANTHROPIC_CUSTOM_HEADERS
 exec claude "$@"
