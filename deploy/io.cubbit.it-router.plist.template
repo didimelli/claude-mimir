@@ -6,15 +6,15 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/zsh</string>
-    <string>/Users/YOU/.config/it-gateway/run.sh</string>
+    <string>@HOME@/.config/it-gateway/run.sh</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key><string>/Users/YOU/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PATH</key><string>@HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/Users/YOU/Library/Logs/it-router.log</string>
-  <key>StandardErrorPath</key><string>/Users/YOU/Library/Logs/it-router.log</string>
+  <key>StandardOutPath</key><string>@HOME@/Library/Logs/it-router.log</string>
+  <key>StandardErrorPath</key><string>@HOME@/Library/Logs/it-router.log</string>
 </dict>
 </plist>

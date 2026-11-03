@@ -1,0 +1,24 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      - run: go test -race ./...
+      - name: shell syntax
+        run: |
+          sudo apt-get install -y -qq zsh >/dev/null
+          bash -n deploy/deploy.sh deploy/claude-mimir tools/devrouter.sh
+          zsh -n deploy/run.sh
+      - name: python tools compile
+        run: python3 -m py_compile tools/*.py
