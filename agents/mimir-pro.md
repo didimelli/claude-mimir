@@ -1,6 +1,6 @@
 ---
 name: mimir-pro
-description: Delegate hard reasoning, large-context analysis, or substantial multi-step work to Cubbit's Mimir Pro model (~900k context). Use when the task is big or difficult and should run on the company model instead of Claude.
+description: Delegate hard reasoning, large-context analysis, or substantial multi-step work to Cubbit's Mimir Pro model (~1M context). Use when the task is big or difficult and should run on the company model instead of Claude.
 model: cubbit/mimir-pro
 ---
 

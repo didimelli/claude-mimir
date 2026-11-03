@@ -1,6 +1,6 @@
 ---
 name: mimir
-description: Delegate general-purpose tasks (code reading, summarising, small edits, research over files) to Cubbit's Mimir model (~900k context). Use for routine delegated work that should run on the company model instead of Claude.
+description: Delegate general-purpose tasks (code reading, summarising, small edits, research over files) to Cubbit's Mimir model (~1M context). Use for routine delegated work that should run on the company model instead of Claude.
 model: cubbit/mimir
 ---
 
