@@ -70,7 +70,7 @@ type rig struct {
 func newRig(t *testing.T, mimirH, anthH http.HandlerFunc) *rig {
 	t.Helper()
 	r := &rig{anth: newFake(t, anthH), mimir: newFake(t, mimirH), logPath: filepath.Join(t.TempDir(), "log.jsonl")}
-	g, err := newGateway(config{anthropic: r.anth.URL, litellm: "http://127.0.0.1:1", litellmKey: "k", logPath: r.logPath,
+	g, err := newGateway(config{anthropic: r.anth.URL, logPath: r.logPath,
 		prefix: []string{"cubbit/"}, mimirURL: r.mimir.URL + "/anthropic", mimirKey: "mimir-test-key"})
 	if err != nil {
 		t.Fatal(err)
@@ -82,7 +82,7 @@ func newRig(t *testing.T, mimirH, anthH http.HandlerFunc) *rig {
 
 var claudeHeaders = map[string]string{
 	"Authorization": "Bearer sk-ant-oat01-FAKE", "Anthropic-Beta": "oauth-2025-04-20,claude-code-20250219", "Anthropic-Version": "2023-06-01",
-	"Content-Type": "application/json", "X-Claude-Code-Session-Id": "sess-1", "X-Litellm-Api-Key": "Bearer sk-local-gateway",
+	"Content-Type": "application/json", "X-Claude-Code-Session-Id": "sess-1",
 	"X-Stainless-Lang": "js", "Accept-Encoding": "gzip, br",
 }
 
@@ -147,7 +147,7 @@ func TestDirectMimirRequest(t *testing.T) {
 	if got.header.Get("X-Api-Key") != "mimir-test-key" {
 		t.Errorf("x-api-key not set")
 	}
-	for _, h := range []string{"Authorization", "Anthropic-Beta", "X-Claude-Code-Session-Id", "X-Litellm-Api-Key", "X-Stainless-Lang", "Accept-Encoding"} {
+	for _, h := range []string{"Authorization", "Anthropic-Beta", "X-Claude-Code-Session-Id", "X-Stainless-Lang", "Accept-Encoding"} {
 		if got.header.Get(h) != "" {
 			t.Errorf("%s was forwarded to Mimir", h)
 		}
@@ -180,7 +180,7 @@ func TestClaudeLegUntouchedInDirectMode(t *testing.T) {
 	if sha256.Sum256(got.body) != sha256.Sum256(body) {
 		t.Errorf("Claude body changed")
 	}
-	if got.header.Get("Authorization") != "Bearer sk-ant-oat01-FAKE" || got.header.Get("Anthropic-Beta") == "" || got.header.Get("X-Litellm-Api-Key") != "" {
+	if got.header.Get("Authorization") != "Bearer sk-ant-oat01-FAKE" || got.header.Get("Anthropic-Beta") == "" {
 		t.Errorf("Claude headers wrong: %v", got.header)
 	}
 	if r.mimir.count() != 0 {
@@ -277,7 +277,7 @@ func TestHealthDirect(t *testing.T) {
 	}
 	var h map[string]string
 	_ = json.NewDecoder(resp.Body).Decode(&h)
-	if h["router"] != "ok" || h["litellm"] != "not used" || !strings.HasPrefix(h["mimir"], "direct") {
+	if h["router"] != "ok" || !strings.HasPrefix(h["mimir"], "direct") || len(h) != 3 {
 		t.Fatalf("%v", h)
 	}
 	if resp, _ := http.Get(r.srv.URL + "/health/liveliness"); resp.StatusCode != 200 {
@@ -332,16 +332,16 @@ func TestFirstMessageStableAcrossAGrowingConversation(t *testing.T) {
 
 func TestParseConfig(t *testing.T) {
 	env := func(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
-	if _, err := parseConfig([]string{"--mimir-url", "https://m/anthropic"}, env(nil)); err == nil || !strings.Contains(err.Error(), "MIMIR_API_KEY") {
+	if _, err := parseConfig(nil, env(nil)); err == nil || !strings.Contains(err.Error(), "MIMIR_API_KEY") {
 		t.Errorf("a missing key must fail at start: %v", err)
 	}
 	cfg, err := parseConfig([]string{"--mimir-url", "https://m/anthropic/", "--port", "4015"}, env(map[string]string{"MIMIR_API_KEY": "k"}))
 	if err != nil || cfg.mimirURL != "https://m/anthropic" || cfg.mimirKey != "k" || cfg.port != 4015 || cfg.prefix[0] != "cubbit/" {
 		t.Errorf("%+v %v", cfg, err)
 	}
-	cfg, err = parseConfig([]string{"--litellm", "http://x:1/", "--litellm-key", "sk-test", "--prefix", "a/", "--prefix", "b/"}, env(nil))
-	if err != nil || cfg.mimirURL != "" || cfg.litellm != "http://x:1" || len(cfg.prefix) != 2 {
-		t.Errorf("litellm mode: %+v %v", cfg, err)
+	cfg, err = parseConfig([]string{"--prefix", "a/", "--prefix", "b/"}, env(map[string]string{"MIMIR_API_KEY": "k"}))
+	if err != nil || cfg.mimirURL != "https://mimir.example/anthropic" || len(cfg.prefix) != 2 {
+		t.Errorf("defaults: %+v %v", cfg, err)
 	}
 	if _, err := parseConfig([]string{"--nope"}, env(nil)); err == nil {
 		t.Errorf("unknown flag must fail")

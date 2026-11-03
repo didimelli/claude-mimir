@@ -36,6 +36,7 @@ func TestBinaryShutsDownOnSIGTERM(t *testing.T) {
 	port := l.Addr().(*net.TCPAddr).Port
 	_ = l.Close()
 	cmd := exec.Command(buildBinary(t), "--port", strconv.Itoa(port), "--log", filepath.Join(t.TempDir(), "l.jsonl"))
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "MIMIR_API_KEY=test-key"}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}

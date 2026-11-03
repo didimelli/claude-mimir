@@ -20,28 +20,20 @@ type multiFlag []string
 func (m *multiFlag) String() string     { return strings.Join(*m, ",") }
 func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
 
-// parseConfig reads the command line. The flags are the same as the Python router's, plus --mimir-url, so the
-// same test suite runs against either implementation.
+// parseConfig reads the command line; MIMIR_API_KEY comes from the environment.
 func parseConfig(args []string, getenv func(string) string) (config, error) {
 	var cfg config
 	var prefixes multiFlag
-	mimirURL := ""
 	var efforts multiFlag
 	home, _ := os.UserHomeDir()
-	litellmKey := getenv("IT_LITELLM_KEY")
-	if litellmKey == "" {
-		litellmKey = "sk-local-gateway"
-	}
 	fs := flag.NewFlagSet("it-router", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fs.StringVar(&cfg.host, "host", "127.0.0.1", "listen address")
 	fs.IntVar(&cfg.port, "port", 4000, "listen port")
 	fs.StringVar(&cfg.anthropic, "anthropic", "https://api.anthropic.com", "upstream for everything that is not a Mimir model")
-	fs.StringVar(&cfg.litellm, "litellm", "http://127.0.0.1:4001", "LiteLLM base URL for Mimir models (LiteLLM mode)")
-	fs.StringVar(&cfg.litellmKey, "litellm-key", litellmKey, "LiteLLM key")
 	fs.Var(&prefixes, "prefix", "model prefix routed to Mimir (default cubbit/)")
 	fs.StringVar(&cfg.logPath, "log", filepath.Join(home, "Library/Logs/it-router.jsonl"), "metadata-only request log")
-	fs.StringVar(&mimirURL, "mimir-url", "", "Mimir's Anthropic-compatible endpoint: send Mimir models there directly, without LiteLLM")
+	fs.StringVar(&cfg.mimirURL, "mimir-url", "https://mimir.example/anthropic", "Mimir's Anthropic-compatible endpoint")
 	fs.Var(&efforts, "mimir-effort", "model=effort sent to Mimir as adaptive thinking (repeatable; 'none' sends nothing; default cubbit/mimir-pro=high)")
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
@@ -65,12 +57,9 @@ func parseConfig(args []string, getenv func(string) string) (config, error) {
 		}
 		cfg.effort[model] = level
 	}
-	cfg.anthropic, cfg.litellm = strings.TrimRight(cfg.anthropic, "/"), strings.TrimRight(cfg.litellm, "/")
-	if mimirURL != "" {
-		cfg.mimirURL = strings.TrimRight(mimirURL, "/")
-		if cfg.mimirKey = getenv("MIMIR_API_KEY"); cfg.mimirKey == "" {
-			return cfg, errors.New("--mimir-url needs MIMIR_API_KEY in the environment")
-		}
+	cfg.anthropic, cfg.mimirURL = strings.TrimRight(cfg.anthropic, "/"), strings.TrimRight(cfg.mimirURL, "/")
+	if cfg.mimirKey = getenv("MIMIR_API_KEY"); cfg.mimirKey == "" {
+		return cfg, errors.New("MIMIR_API_KEY is missing from the environment")
 	}
 	return cfg, nil
 }
@@ -87,11 +76,7 @@ func main() {
 		os.Exit(2)
 	}
 	srv := &http.Server{Addr: fmt.Sprintf("%s:%d", cfg.host, cfg.port), Handler: g, ReadHeaderTimeout: 30 * time.Second, IdleTimeout: 120 * time.Second}
-	mimirTarget := cfg.litellm + " (LiteLLM)"
-	if cfg.mimirURL != "" {
-		mimirTarget = cfg.mimirURL + " (direct)"
-	}
-	fmt.Fprintf(os.Stderr, "router on %s: %v -> %s, everything else -> %s; log %s\n", srv.Addr, cfg.prefix, mimirTarget, cfg.anthropic, cfg.logPath)
+	fmt.Fprintf(os.Stderr, "router on %s: %v -> %s, everything else -> %s; log %s\n", srv.Addr, cfg.prefix, cfg.mimirURL, cfg.anthropic, cfg.logPath)
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe() }()
 	sig := make(chan os.Signal, 1)

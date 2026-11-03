@@ -12,7 +12,7 @@ import (
 //   - metadata carries Anthropic account identifiers;
 //   - context_management is a Claude-only feature;
 //   - thinking and output_config are validated per Mimir model and differently for each (slim rejects effort high,
-//     mimir rejects medium, adaptive thinking alone fails on slim), and the LiteLLM path dropped them too.
+//     mimir rejects medium, adaptive thinking alone fails on slim).
 //     A model with a configured effort (see mimirEffort) gets both set explicitly instead: left to its default,
 //     mimir-pro sometimes reasons until max_tokens and returns an empty turn.
 var mimirDropFields = []string{"metadata", "context_management", "thinking", "output_config"}

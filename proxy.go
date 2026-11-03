@@ -18,10 +18,10 @@ import (
 )
 
 type config struct {
-	host, anthropic, litellm, litellmKey, logPath, mimirURL, mimirKey string
-	port                                                              int
-	prefix                                                            []string
-	effort                                                            map[string]string // request model -> reasoning effort sent to Mimir
+	host, anthropic, logPath, mimirURL, mimirKey string
+	port                                         int
+	prefix                                       []string
+	effort                                       map[string]string // request model -> reasoning effort sent to Mimir
 }
 
 type gateway struct {
@@ -29,10 +29,8 @@ type gateway struct {
 	transport *http.Transport
 	log       *reqLogger
 	anth      *httputil.ReverseProxy
-	lite      *httputil.ReverseProxy
 	mimir     *httputil.ReverseProxy
 	anthURL   *url.URL
-	liteURL   *url.URL
 	mimirU    *url.URL
 }
 
@@ -147,40 +145,25 @@ func newGateway(cfg config) (*gateway, error) {
 	if g.anthURL, err = url.Parse(cfg.anthropic); err != nil {
 		return nil, err
 	}
-	if g.liteURL, err = url.Parse(cfg.litellm); err != nil {
+	if g.mimirU, err = url.Parse(cfg.mimirURL); err != nil {
 		return nil, err
 	}
-	g.anth = g.newProxy(func(pr *httputil.ProxyRequest) {
-		pr.SetURL(g.anthURL)
-		pr.Out.Header.Del("X-Litellm-Api-Key")
-	})
-	g.lite = g.newProxy(func(pr *httputil.ProxyRequest) {
-		pr.SetURL(g.liteURL)
-		// the Claude login never goes to LiteLLM or Mimir
-		pr.Out.Header.Del("Authorization")
-		pr.Out.Header.Del("X-Api-Key")
-		pr.Out.Header.Set("X-Litellm-Api-Key", "Bearer "+g.cfg.litellmKey)
-	})
-	if cfg.mimirURL != "" {
-		if g.mimirU, err = url.Parse(cfg.mimirURL); err != nil {
-			return nil, err
+	g.anth = g.newProxy(func(pr *httputil.ProxyRequest) { pr.SetURL(g.anthURL) })
+	g.mimir = g.newProxy(func(pr *httputil.ProxyRequest) {
+		pr.SetURL(g.mimirU)
+		// only what Mimir needs: the Claude login, beta flags and client fingerprints are not forwarded
+		h := http.Header{}
+		for _, k := range []string{"Content-Type", "Accept", "Anthropic-Version", "User-Agent"} {
+			if v := pr.In.Header.Values(k); len(v) > 0 {
+				h[k] = append([]string(nil), v...)
+			}
 		}
-		g.mimir = g.newProxy(func(pr *httputil.ProxyRequest) {
-			pr.SetURL(g.mimirU)
-			// only what Mimir needs: the Claude login, beta flags and client fingerprints are not forwarded
-			h := http.Header{}
-			for _, k := range []string{"Content-Type", "Accept", "Anthropic-Version", "User-Agent"} {
-				if v := pr.In.Header.Values(k); len(v) > 0 {
-					h[k] = append([]string(nil), v...)
-				}
-			}
-			if h.Get("Content-Type") == "" {
-				h.Set("Content-Type", "application/json")
-			}
-			h.Set("X-Api-Key", g.cfg.mimirKey)
-			pr.Out.Header = h
-		})
-	}
+		if h.Get("Content-Type") == "" {
+			h.Set("Content-Type", "application/json")
+		}
+		h.Set("X-Api-Key", g.cfg.mimirKey)
+		pr.Out.Header = h
+	})
 	return g, nil
 }
 
@@ -213,7 +196,7 @@ func (g *gateway) modifyResponse(resp *http.Response) error {
 	if resp.StatusCode >= 400 {
 		payload, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		_ = resp.Body.Close()
-		if g.mimir != nil && ri.route == "mimir" {
+		if ri.route == "mimir" {
 			if st, nb, changed := rewriteMimirError(resp.StatusCode, payload); changed {
 				resp.StatusCode, resp.Status = st, fmt.Sprintf("%d %s", st, http.StatusText(st))
 				payload = nb
@@ -230,7 +213,7 @@ func (g *gateway) modifyResponse(resp *http.Response) error {
 		ri.finish()
 		return nil
 	}
-	if g.mimir != nil && ri.route == "mimir" && isEventStream(resp.Header.Get("Content-Type")) && resp.Header.Get("Content-Encoding") == "" {
+	if ri.route == "mimir" && isEventStream(resp.Header.Get("Content-Type")) && resp.Header.Get("Content-Encoding") == "" {
 		ri.fix = &fixStats{}
 		resp.Body = &sseFixer{rc: resp.Body, stats: ri.fix}
 	}
@@ -273,25 +256,8 @@ func (g *gateway) isMimir(model string) bool {
 }
 
 func (g *gateway) health(w http.ResponseWriter) {
-	litellm := "ok"
-	if g.mimir == nil {
-		c := &http.Client{Transport: g.transport, Timeout: 3 * time.Second}
-		resp, err := c.Get(g.cfg.litellm + "/health/liveliness")
-		if err != nil {
-			litellm = fmt.Sprintf("down (%T)", err)
-		} else {
-			_ = resp.Body.Close()
-			if resp.StatusCode != 200 {
-				litellm = fmt.Sprintf("http %d", resp.StatusCode)
-			}
-		}
-	}
 	w.Header().Set("Content-Type", "application/json")
-	mimir := "via litellm"
-	if g.mimir != nil {
-		litellm, mimir = "not used", "direct ("+g.mimirU.Host+")"
-	}
-	_ = json.NewEncoder(w).Encode(map[string]string{"router": "ok", "litellm": litellm, "mimir": mimir, "anthropic": g.cfg.anthropic})
+	_ = json.NewEncoder(w).Encode(map[string]string{"router": "ok", "mimir": "direct (" + g.mimirU.Host + ")", "anthropic": g.cfg.anthropic})
 }
 
 func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -322,10 +288,7 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	mimir := g.isMimir(model)
 	route, proxy, upstream := "anthropic", g.anth, g.anthURL
 	if mimir {
-		route, proxy, upstream = "mimir", g.lite, g.liteURL
-		if g.mimir != nil {
-			proxy, upstream = g.mimir, g.mimirU
-		}
+		route, proxy, upstream = "mimir", g.mimir, g.mimirU
 	}
 	ri := &reqInfo{g: g, route: route, start: time.Now(), logIt: shape != nil}
 	ri.rec = map[string]any{
@@ -334,7 +297,7 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"request_class": nilIfEmpty(r.Header.Get("X-Claude-Code-Request-Class")), "agent": nilIfEmpty(r.Header.Get("X-Claude-Code-Agent-Type")),
 	}
 	ri.rec["upstream_host"] = upstream.Host
-	if shape != nil && mimir && g.mimir != nil {
+	if shape != nil && mimir {
 		src := decodeBody(body, r.Header.Get("Content-Encoding"))
 		if strings.HasSuffix(path, "/count_tokens") { // Mimir has no count_tokens: answer with a local estimate
 			ri.status = http.StatusOK

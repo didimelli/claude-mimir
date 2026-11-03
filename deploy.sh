@@ -20,9 +20,6 @@ plan() { # <name> <mode>
   if [ ! -e "$DEST/$f" ]; then echo "  new      $f"; elif cmp -s "$TMP/$f" "$DEST/$f"; then echo "  same     $f"; else echo "  replace  $f"; fi
 }
 echo "changes:"; plan it-router; plan run.sh
-for f in router.py config.yaml mimir_hooks.py diag_hooks.py; do # the rollback stack: reported, never touched
-  if [ -e "$DEST/$f" ] && ! cmp -s "$REPO/litellm/$f" "$DEST/$f"; then echo "  differs  $f (rollback stack, not touched)"; fi
-done
 [ $DRY = 1 ] && { echo "dry run: nothing changed"; exit 0; }
 
 BK=$DEST/backup-$TS; mkdir -p "$BK"
