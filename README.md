@@ -5,7 +5,8 @@ Run Cubbit's **Mimir** models as real [Claude Code](https://claude.com/claude-co
 Claude Code talks to a single `ANTHROPIC_BASE_URL`. `claude-mimir` puts a small local gateway (`it-router`, one Go binary, standard library only) at that URL. The gateway routes each request by its `model`:
 
 ```
-Claude Code --> it-router :4000 --+--> cubbit/*        --> Mimir's Anthropic-compatible endpoint ($MIMIR_ANTHROPIC_URL)
+Claude Code --> it-router :4000 --+--> cubbit/*        --> Mimir: /v1 chat completions, translated (MIMIR_API=openai)
+                                  |                        or /anthropic, passed through and repaired (MIMIR_API=anthropic)
                                   +--> anything else  --> api.anthropic.com, byte for byte
 ```
 
@@ -40,7 +41,7 @@ git clone https://github.com/didimelli/claude-mimir && cd claude-mimir
 # 1. Configuration: the key and the endpoint
 mkdir -p ~/.config/it-gateway
 cp .env.example ~/.config/it-gateway/env && chmod 600 ~/.config/it-gateway/env
-$EDITOR ~/.config/it-gateway/env          # set MIMIR_API_KEY and MIMIR_ANTHROPIC_URL
+$EDITOR ~/.config/it-gateway/env          # set MIMIR_API_KEY, MIMIR_API and the endpoint for it
 
 # 2. Build and install it-router and run.sh into ~/.config/it-gateway/
 deploy/deploy.sh --dry-run && deploy/deploy.sh
@@ -104,7 +105,9 @@ Everything comes from the environment. `deploy/run.sh` (what launchd runs) first
 | Variable | Required | Meaning |
 |---|---|---|
 | `MIMIR_API_KEY` | yes | Mimir key, sent as `x-api-key`. Without it, `run.sh` reads `MIMIR_API_KEY_FILE` (default `~/.config/opencode/mimir-key`) |
-| `MIMIR_ANTHROPIC_URL` | yes | Mimir's Anthropic-compatible endpoint, for example `https://<mimir host>/anthropic` (`--mimir-url` overrides it) |
+| `MIMIR_API` | no | `anthropic` (default for now) or `openai`; see [Two ways to reach Mimir](#two-ways-to-reach-mimir) (`--mimir-api`) |
+| `MIMIR_OPENAI_URL` | with `openai` | Mimir's OpenAI-compatible base URL, for example `https://<mimir host>/v1` (`--mimir-url` overrides it) |
+| `MIMIR_ANTHROPIC_URL` | with `anthropic` | Mimir's Anthropic-compatible endpoint, for example `https://<mimir host>/anthropic` (`--mimir-url` overrides it) |
 | `IT_ROUTER_PORT` | no | listen port, default `4000` (the listener binds to `127.0.0.1` only) |
 | `IT_ROUTER_LOG` | no | request log, default `~/Library/Logs/it-router.jsonl` |
 
@@ -122,10 +125,24 @@ Everything comes from the environment. `deploy/run.sh` (what launchd runs) first
 - **Rollback:** restore `it-router` and `run.sh` from the latest backup directory, then restart.
 - **Logs:**
   - `~/Library/Logs/it-router.log` is the process output.
-  - `~/Library/Logs/it-router.jsonl` has one line per `/v1/messages` request: route, model, status, `upstream_host`, ttfb and total ms, message and tool counts, `orphan_tool_results`, `first_hash`, the upstream `request_id`. On the Mimir leg it also has `folded`, `dropped_fields`, `effort` and `stream_fixes`.
+  - `~/Library/Logs/it-router.jsonl` has one line per `/v1/messages` request: route, model, status, `upstream_host`, ttfb and total ms, message and tool counts, `orphan_tool_results`, `first_hash`, the upstream `request_id`. On the Mimir leg it also has `folded`, `dropped_fields`, `effort` and `stream_fixes`; with `openai`, also `mimir_api`, `input_tokens`, `output_tokens` (real, from Mimir), `tool_calls` and `reasoning_chunks`.
   - `error: client went away` means the client left before the response was complete.
 
+## Two ways to reach Mimir
+
+Mimir serves the same models on two endpoints, and the gateway can use either (`MIMIR_API`):
+
+- **`openai`**: the gateway translates each Anthropic Messages request into a Chat Completions request for `/v1`, and the reply (streamed or not) back into the Anthropic format. It writes the Anthropic stream itself, so the stream is well-formed by construction. Token usage is real, and `reasoning_effort` (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) works on every model.
+  - Request: the system prompt becomes a system message; mid-conversation system entries are folded as on `/anthropic`; text and images become content parts; `tool_use` blocks become `tool_calls` and `tool_result` blocks become `role: tool` messages; tools, `tool_choice`, `max_tokens`, `stop_sequences`, `temperature` and `top_p` map across.
+  - Reply: text deltas, tool calls and their argument fragments become Anthropic blocks in order; `finish_reason` maps to `stop_reason` (`stop` → `end_turn`, `length` → `max_tokens`, `tool_calls` → `tool_use`); reasoning is dropped; errors are converted, with the same rewrites as below.
+  - `--mimir-effort model=effort` sends a reasoning effort; by default none is sent, which is what was measured best.
+- **`anthropic`**: the request goes to `/anthropic` nearly as is, and the gateway repairs what that endpoint gets wrong (the notes below).
+
+Why `openai` exists: on `/anthropic`, `mimir-pro` sometimes reasons until `max_tokens` and returns an empty turn after about 3 minutes, and none of `thinking`, `output_config.effort` or `budget_tokens` stops it. On a probe prompt, 4 of 7 runs did that on `/anthropic`, and 0 of 7 on `/v1`. See issue #4.
+
 ## Notes on the upstream API
+
+These apply to the `anthropic` mode unless they say otherwise.
 
 What the Mimir leg changes, and why. Each item was found by probing Mimir with real Claude Code requests.
 
@@ -144,7 +161,7 @@ What the Mimir leg changes, and why. Each item was found by probing Mimir with r
   - **Reasoning and stop reason:** `thinking_delta` events arrive inside `text` blocks, so they are dropped. `stop_reason` is `end_turn` even when a `tool_use` was streamed, so it is corrected to `tool_use`.
   - **Parallel tool calls:** blocks interleave, one block is stopped twice while another is never stopped, and late deltas arrive for closed blocks. The gateway closes the right block, adds missing stops and drops late deltas.
   - **Truncated streams:** at `max_tokens` the stream ends without `message_delta`/`message_stop`. On a clean end the gateway synthesizes them with `stop_reason: max_tokens`. An upstream error is never turned into a clean end.
-- **`count_tokens`** is not supported by Mimir (500), so the gateway answers it locally with an estimate.
+- **`count_tokens`** is not supported by Mimir (500), so the gateway answers it locally with an estimate (both modes).
 - **Errors Claude Code acts on are rewritten:**
   - an unknown model (`500`, which Claude Code would retry) becomes `404`;
   - a context overflow becomes Anthropic's `prompt is too long: M tokens > N maximum`;

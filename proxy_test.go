@@ -456,7 +456,14 @@ func TestGatewaySendsConfiguredEffortPerModel(t *testing.T) {
 }
 
 func TestParseConfigMimirEffort(t *testing.T) {
-	env := func(map[string]string) func(string) string { return func(string) string { return "k" } }
+	env := func(map[string]string) func(string) string {
+		return func(k string) string {
+			if k == "MIMIR_API" {
+				return ""
+			}
+			return "k"
+		}
+	}
 	cfg, err := parseConfig(nil, env(nil))
 	if err != nil || cfg.effort["cubbit/mimir-pro"] != "high" {
 		t.Fatalf("default: %v %v", cfg.effort, err)
