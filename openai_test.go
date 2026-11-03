@@ -555,7 +555,7 @@ func TestGatewayOpenAINonStreamAndErrors(t *testing.T) {
 func TestParseConfigMimirAPI(t *testing.T) {
 	env := func(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
 	cfg, err := parseConfig([]string{"--mimir-api", "openai"}, env(map[string]string{"MIMIR_API_KEY": "k", "MIMIR_OPENAI_URL": "https://m/v1/"}))
-	if err != nil || cfg.mimirAPI != "openai" || cfg.mimirURL != "https://m/v1" || len(cfg.effort) != 1 || cfg.effort["cubbit/mimir-pro"] != "low" {
+	if err != nil || cfg.mimirAPI != "openai" || cfg.mimirURL != "https://m/v1" || len(cfg.effort) != 1 || cfg.effort["cubbit/mimir-pro"] != "medium" {
 		t.Fatalf("%+v %v", cfg, err)
 	}
 	cfg, err = parseConfig([]string{"--mimir-effort", "cubbit/mimir-pro=none"}, env(map[string]string{"MIMIR_API": "openai", "MIMIR_API_KEY": "k", "MIMIR_OPENAI_URL": "https://m/v1"}))
