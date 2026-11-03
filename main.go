@@ -20,7 +20,8 @@ type multiFlag []string
 func (m *multiFlag) String() string     { return strings.Join(*m, ",") }
 func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
 
-// parseConfig reads the command line; MIMIR_API_KEY comes from the environment.
+// parseConfig reads the command line; MIMIR_API_KEY and MIMIR_ANTHROPIC_URL come from the environment (--mimir-url
+// overrides the latter).
 func parseConfig(args []string, getenv func(string) string) (config, error) {
 	var cfg config
 	var prefixes multiFlag
@@ -33,7 +34,7 @@ func parseConfig(args []string, getenv func(string) string) (config, error) {
 	fs.StringVar(&cfg.anthropic, "anthropic", "https://api.anthropic.com", "upstream for everything that is not a Mimir model")
 	fs.Var(&prefixes, "prefix", "model prefix routed to Mimir (default cubbit/)")
 	fs.StringVar(&cfg.logPath, "log", filepath.Join(home, "Library/Logs/it-router.jsonl"), "metadata-only request log")
-	fs.StringVar(&cfg.mimirURL, "mimir-url", "https://mimir.example/anthropic", "Mimir's Anthropic-compatible endpoint")
+	fs.StringVar(&cfg.mimirURL, "mimir-url", getenv("MIMIR_ANTHROPIC_URL"), "Mimir's Anthropic-compatible endpoint (default $MIMIR_ANTHROPIC_URL)")
 	fs.Var(&efforts, "mimir-effort", "model=effort sent to Mimir as adaptive thinking (repeatable; 'none' sends nothing; default cubbit/mimir-pro=high)")
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
@@ -58,6 +59,9 @@ func parseConfig(args []string, getenv func(string) string) (config, error) {
 		cfg.effort[model] = level
 	}
 	cfg.anthropic, cfg.mimirURL = strings.TrimRight(cfg.anthropic, "/"), strings.TrimRight(cfg.mimirURL, "/")
+	if cfg.mimirURL == "" {
+		return cfg, errors.New("MIMIR_ANTHROPIC_URL is missing from the environment (or pass --mimir-url)")
+	}
 	if cfg.mimirKey = getenv("MIMIR_API_KEY"); cfg.mimirKey == "" {
 		return cfg, errors.New("MIMIR_API_KEY is missing from the environment")
 	}

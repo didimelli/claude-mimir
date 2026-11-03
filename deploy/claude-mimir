@@ -1,0 +1,8 @@
+#!/bin/bash
+# Claude Code routed through the local gateway (port 4000), for sessions that use Mimir subagents.
+# Plain `claude` goes straight to Anthropic. The gateway sends cubbit/* models to Mimir and everything else
+# to Anthropic untouched; it needs no extra headers.
+# Needs the gateway running: curl -s http://127.0.0.1:4000/router/health
+export ANTHROPIC_BASE_URL=http://127.0.0.1:4000
+unset ANTHROPIC_CUSTOM_HEADERS
+exec claude "$@"

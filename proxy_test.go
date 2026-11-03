@@ -332,16 +332,19 @@ func TestFirstMessageStableAcrossAGrowingConversation(t *testing.T) {
 
 func TestParseConfig(t *testing.T) {
 	env := func(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
-	if _, err := parseConfig(nil, env(nil)); err == nil || !strings.Contains(err.Error(), "MIMIR_API_KEY") {
+	if _, err := parseConfig([]string{"--mimir-url", "https://m/anthropic"}, env(nil)); err == nil || !strings.Contains(err.Error(), "MIMIR_API_KEY") {
 		t.Errorf("a missing key must fail at start: %v", err)
 	}
 	cfg, err := parseConfig([]string{"--mimir-url", "https://m/anthropic/", "--port", "4015"}, env(map[string]string{"MIMIR_API_KEY": "k"}))
 	if err != nil || cfg.mimirURL != "https://m/anthropic" || cfg.mimirKey != "k" || cfg.port != 4015 || cfg.prefix[0] != "cubbit/" {
 		t.Errorf("%+v %v", cfg, err)
 	}
-	cfg, err = parseConfig([]string{"--prefix", "a/", "--prefix", "b/"}, env(map[string]string{"MIMIR_API_KEY": "k"}))
-	if err != nil || cfg.mimirURL != "https://mimir.example/anthropic" || len(cfg.prefix) != 2 {
-		t.Errorf("defaults: %+v %v", cfg, err)
+	cfg, err = parseConfig([]string{"--prefix", "a/", "--prefix", "b/"}, env(map[string]string{"MIMIR_API_KEY": "k", "MIMIR_ANTHROPIC_URL": "https://e/anthropic/"}))
+	if err != nil || cfg.mimirURL != "https://e/anthropic" || len(cfg.prefix) != 2 {
+		t.Errorf("endpoint from the environment: %+v %v", cfg, err)
+	}
+	if _, err := parseConfig(nil, env(map[string]string{"MIMIR_API_KEY": "k"})); err == nil || !strings.Contains(err.Error(), "MIMIR_ANTHROPIC_URL") {
+		t.Errorf("a missing endpoint must fail at start: %v", err)
 	}
 	if _, err := parseConfig([]string{"--nope"}, env(nil)); err == nil {
 		t.Errorf("unknown flag must fail")

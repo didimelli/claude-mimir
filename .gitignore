@@ -1,0 +1,11 @@
+# binaries
+/it-router
+/ccgateway
+# local configuration (holds the API key)
+env
+.env
+# scratch output of the tools
+*.jsonl
+__pycache__/
+# devrouter.sh state
+tools/run/
