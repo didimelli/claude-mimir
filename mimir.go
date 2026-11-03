@@ -23,8 +23,6 @@ type mimirInfo struct {
 	Effort  string // reasoning effort sent, "" when none
 }
 
-var validEffort = map[string]bool{"low": true, "medium": true, "high": true, "xhigh": true, "max": true}
-
 // shapeMimirBody makes a Claude Code request acceptable to Mimir's Anthropic-compatible endpoint. Only the fields
 // named above and the system entries inside messages are touched; everything else is forwarded as received.
 // A non-empty effort replaces thinking and output_config with adaptive thinking at that effort.

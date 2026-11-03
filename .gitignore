@@ -1,6 +1,7 @@
 # binaries
 /it-router
 /ccgateway
+/claude-mimir
 # local configuration (holds the API key)
 env
 .env

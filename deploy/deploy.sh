@@ -20,8 +20,10 @@ plan() { # <name> <mode>
   if [ ! -e "$DEST/$f" ]; then echo "  new      $f"; elif cmp -s "$TMP/$f" "$DEST/$f"; then echo "  same     $f"; else echo "  replace  $f"; fi
 }
 echo "changes:"; plan it-router; plan run.sh
-if [ -z "${MIMIR_ANTHROPIC_URL:-}" ] && ! grep -qs '^MIMIR_ANTHROPIC_URL=.' "$DEST/env"; then
-  echo "WARNING: MIMIR_ANTHROPIC_URL is set neither in $DEST/env nor here: the gateway will exit at start-up (see .env.example)"
+api=${MIMIR_API:-$(sed -n 's/^MIMIR_API=\([a-z]*\).*/\1/p' "$DEST/env" 2>/dev/null | tail -1)}
+var=MIMIR_ANTHROPIC_URL; [ "${api:-anthropic}" = openai ] && var=MIMIR_OPENAI_URL
+if [ -z "${!var:-}" ] && ! grep -qs "^$var=." "$DEST/env"; then
+  echo "WARNING: $var (needed by MIMIR_API=${api:-anthropic}) is set neither in $DEST/env nor here: the gateway will exit at start-up (see .env.example)"
 fi
 [ $DRY = 1 ] && { echo "dry run: nothing changed"; exit 0; }
 

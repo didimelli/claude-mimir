@@ -19,6 +19,7 @@ import (
 
 type config struct {
 	host, anthropic, logPath, mimirURL, mimirKey string
+	mimirAPI                                     string // "anthropic" (mimirURL is Mimir's /anthropic) or "openai" (mimirURL is its /v1)
 	port                                         int
 	prefix                                       []string
 	effort                                       map[string]string // request model -> reasoning effort sent to Mimir
@@ -49,6 +50,7 @@ type reqInfo struct {
 	errMsg string
 	sent   int64
 	fix    *fixStats
+	oai    *oaiStats
 	once   sync.Once
 }
 
@@ -74,6 +76,18 @@ func (ri *reqInfo) finish() {
 		if ri.fix != nil {
 			if c := ri.fix.counts(); len(c) > 0 {
 				ri.rec["stream_fixes"] = c
+			}
+		}
+		if s := ri.oai; s != nil {
+			if s.HaveUsage {
+				ri.rec["input_tokens"], ri.rec["output_tokens"] = s.Usage.PromptTokens, s.Usage.CompletionTokens
+			}
+			ri.rec["reasoning_chunks"], ri.rec["tool_calls"] = s.ReasoningChunks, s.ToolCalls
+			if c := s.counts(); len(c) > 0 {
+				ri.rec["stream_fixes"] = c
+			}
+			if s.StreamError != "" && ri.errMsg == "" {
+				ri.rec["error"] = "mimir stream error: " + s.StreamError
 			}
 		}
 		ri.rec["ms"] = time.Since(ri.start).Milliseconds()
@@ -150,10 +164,13 @@ func newGateway(cfg config) (*gateway, error) {
 	}
 	g.anth = g.newProxy(func(pr *httputil.ProxyRequest) { pr.SetURL(g.anthURL) })
 	g.mimir = g.newProxy(func(pr *httputil.ProxyRequest) {
-		pr.SetURL(g.mimirU)
 		// only what Mimir needs: the Claude login, beta flags and client fingerprints are not forwarded
 		h := http.Header{}
-		for _, k := range []string{"Content-Type", "Accept", "Anthropic-Version", "User-Agent"} {
+		keep := []string{"Content-Type", "Accept", "Anthropic-Version", "User-Agent"}
+		if g.cfg.mimirAPI == "openai" {
+			keep = []string{"Content-Type", "User-Agent"}
+		}
+		for _, k := range keep {
 			if v := pr.In.Header.Values(k); len(v) > 0 {
 				h[k] = append([]string(nil), v...)
 			}
@@ -161,7 +178,16 @@ func newGateway(cfg config) (*gateway, error) {
 		if h.Get("Content-Type") == "" {
 			h.Set("Content-Type", "application/json")
 		}
-		h.Set("X-Api-Key", g.cfg.mimirKey)
+		if g.cfg.mimirAPI == "openai" {
+			// every Messages request becomes a Chat Completions request; the client's query (?beta=true) is Anthropic's
+			pr.Out.URL.Scheme, pr.Out.URL.Host = g.mimirU.Scheme, g.mimirU.Host
+			pr.Out.URL.Path, pr.Out.URL.RawPath, pr.Out.URL.RawQuery = strings.TrimRight(g.mimirU.Path, "/")+"/chat/completions", "", ""
+			pr.Out.Host = ""
+			h.Set("Authorization", "Bearer "+g.cfg.mimirKey)
+		} else {
+			pr.SetURL(g.mimirU)
+			h.Set("X-Api-Key", g.cfg.mimirKey)
+		}
 		pr.Out.Header = h
 	})
 	return g, nil
@@ -193,10 +219,15 @@ func (g *gateway) modifyResponse(resp *http.Response) error {
 		ri.reqID = resp.Header.Get("x-request-id")
 	}
 	ri.rec["ttfb_ms"] = time.Since(ri.start).Milliseconds()
+	openai := ri.route == "mimir" && g.cfg.mimirAPI == "openai"
 	if resp.StatusCode >= 400 {
 		payload, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		_ = resp.Body.Close()
-		if ri.route == "mimir" {
+		if openai {
+			st, nb := translateOpenAIError(resp.StatusCode, payload)
+			resp.StatusCode, resp.Status, payload, ri.status = st, fmt.Sprintf("%d %s", st, http.StatusText(st)), nb, st
+			resp.Header = http.Header{"Content-Type": {"application/json"}}
+		} else if ri.route == "mimir" {
 			if st, nb, changed := rewriteMimirError(resp.StatusCode, payload); changed {
 				resp.StatusCode, resp.Status = st, fmt.Sprintf("%d %s", st, http.StatusText(st))
 				payload = nb
@@ -211,6 +242,29 @@ func (g *gateway) modifyResponse(resp *http.Response) error {
 		resp.ContentLength = int64(len(payload))
 		resp.Header.Del("Content-Length")
 		ri.finish()
+		return nil
+	}
+	if openai {
+		ri.oai = &oaiStats{}
+		if isEventStream(resp.Header.Get("Content-Type")) {
+			resp.Body = newChatStream(resp.Body, ri.oai)
+			resp.Header = http.Header{"Content-Type": {"text/event-stream"}, "Cache-Control": {"no-cache"}}
+		} else {
+			payload, err := io.ReadAll(io.LimitReader(resp.Body, 256<<20))
+			_ = resp.Body.Close()
+			nb, usage, terr := fromChatCompletion(payload)
+			if err != nil || terr != nil {
+				st, eb := translateOpenAIError(502, []byte(fmt.Sprintf(`{"error":{"message":"could not translate Mimir's reply: %v %v"}}`, err, terr)))
+				resp.StatusCode, resp.Status, ri.status, nb = st, fmt.Sprintf("%d %s", st, http.StatusText(st)), st, eb
+				ri.errMsg = "untranslatable reply"
+			} else {
+				ri.oai.Usage, ri.oai.HaveUsage = usage, true
+			}
+			resp.Header = http.Header{"Content-Type": {"application/json"}}
+			resp.Body = io.NopCloser(bytes.NewReader(nb))
+			resp.ContentLength = int64(len(nb))
+		}
+		resp.Body = &countingBody{rc: resp.Body, ri: ri}
 		return nil
 	}
 	if ri.route == "mimir" && isEventStream(resp.Header.Get("Content-Type")) && resp.Header.Get("Content-Encoding") == "" {
@@ -257,7 +311,11 @@ func (g *gateway) isMimir(model string) bool {
 
 func (g *gateway) health(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"router": "ok", "mimir": "direct (" + g.mimirU.Host + ")", "anthropic": g.cfg.anthropic})
+	mimir := "direct (" + g.mimirU.Host + ")"
+	if g.cfg.mimirAPI == "openai" {
+		mimir = "direct (" + g.mimirU.Host + ", openai)"
+	}
+	_ = json.NewEncoder(w).Encode(map[string]string{"router": "ok", "mimir": mimir, "anthropic": g.cfg.anthropic})
 }
 
 func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -307,7 +365,25 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ri.finish()
 			return
 		}
-		if shaped, info, err := shapeMimirBody(src, g.cfg.effort[model]); err != nil {
+		if g.cfg.mimirAPI == "openai" {
+			ri.rec["mimir_api"] = "openai"
+			translated, info, err := toChatCompletions(src, g.cfg.effort[model])
+			if err != nil {
+				ri.status = http.StatusBadRequest
+				ri.errMsg = "untranslatable request: " + err.Error()
+				ri.finish()
+				writeError(w, http.StatusBadRequest, "router: could not translate the request for Mimir: "+err.Error())
+				return
+			}
+			body = translated
+			if info.Effort != "" {
+				ri.rec["effort"] = info.Effort
+			}
+			ri.rec["folded"], ri.rec["dropped_blocks"], ri.rec["hoisted"] = info.Folded, info.foldStats.DroppedBlocks+info.DroppedBlocks, info.Hoisted
+			if info.DroppedTools > 0 {
+				ri.rec["dropped_tools"] = info.DroppedTools
+			}
+		} else if shaped, info, err := shapeMimirBody(src, g.cfg.effort[model]); err != nil {
 			ri.rec["shape_error"] = err.Error() // forward as received and let Mimir answer
 		} else {
 			body = shaped
