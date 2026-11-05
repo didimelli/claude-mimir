@@ -112,12 +112,15 @@ Everything comes from the environment. `deploy/run.sh` (what launchd runs) first
 | `MIMIR_ANTHROPIC_URL` | with `anthropic` | Mimir's Anthropic-compatible endpoint, for example `https://<mimir host>/anthropic` (`--mimir-url` overrides it) |
 | `IT_ROUTER_PORT` | no | listen port, default `4000` (the listener binds to `127.0.0.1` only) |
 | `IT_ROUTER_LOG` | no | request log, default `~/Library/Logs/it-router.jsonl` |
+| `IT_RUNAWAY_GUARD` | no | `log` (default) records runaway replies in the request log, `off` turns that off (`--runaway-guard`); see [Runaway replies](#runaway-replies) |
+| `IT_MAX_REPLY_TEXT` | no | visible reply bytes from which a reply counts as a runaway, default `24576` (`--max-reply-text`) |
 
 `it-router` flags:
 - `--port`, `--host`, `--log`, `--mimir-url`;
 - `--anthropic`, the upstream for non-Mimir models;
 - `--prefix`, the model prefix routed to Mimir (repeatable, default `cubbit/`);
-- `--mimir-effort model=effort`, see below.
+- `--mimir-effort model=effort`, see below;
+- `--runaway-guard log|off`, `--max-reply-text BYTES`, see [Runaway replies](#runaway-replies).
 
 ## Operating
 
@@ -127,8 +130,22 @@ Everything comes from the environment. `deploy/run.sh` (what launchd runs) first
 - **Rollback:** restore `it-router` and `run.sh` from the latest backup directory, then restart.
 - **Logs:**
   - `~/Library/Logs/it-router.log` is the process output.
-  - `~/Library/Logs/it-router.jsonl` has one line per `/v1/messages` request: route, model, status, `upstream_host`, ttfb and total ms, message and tool counts, `orphan_tool_results`, `first_hash`, the upstream `request_id`. On the Mimir leg it also has `folded`, `dropped_fields`, `effort` and `stream_fixes`; with `openai`, also `mimir_api`, `input_tokens`, `output_tokens` (real, from Mimir), `tool_calls` and `reasoning_chunks`.
+  - `~/Library/Logs/it-router.jsonl` has one line per `/v1/messages` request: `ts` (local time, no offset) and `ts_utc` (UTC, RFC 3339), route, model, status, `upstream_host`, ttfb and total ms, message and tool counts, `orphan_tool_results`, `first_hash`, the upstream `request_id`. On the Mimir leg it also has `folded`, `dropped_fields`, `effort` and `stream_fixes`; with `openai`, also `mimir_api`, `input_tokens`, `output_tokens` (real, from Mimir), `tool_calls` and `reasoning_chunks`; for streamed replies also `text_chars`, `reasoning_chars`, `text_max_repeat`, `reasoning_max_repeat` and, when the reply looks like a runaway, `runaway`.
   - `error: client went away` means the client left before the response was complete.
+
+## Runaway replies
+
+Sometimes Mimir produces a reply that never ends: tens of thousands of tokens of text instead of a tool call, either one line repeated over and over or long unproductive deliberation. With the `openai` API the router measures every streamed reply, for the visible text and for the reasoning (which is never forwarded, so this is the only place it shows), and writes numbers to the request log. It changes nothing in what the client receives, and it never logs text.
+
+- `text_chars`, `reasoning_chars`: bytes of each.
+- `text_max_repeat`, `reasoning_max_repeat`: the highest number of times one identical line appeared inside any 60 consecutive non-empty lines. A loop that interleaves a few filler lines still shows up.
+- `runaway`: present only when the reply looks like one. A comma-separated list of `text_budget` (visible text of `--max-reply-text` bytes or more, default 24 KiB, about 6k tokens; normal replies are far smaller), `text_repeat` and `reasoning_repeat` (one line filling 30 of the last 60 lines).
+
+```bash
+jq 'select(.runaway)' ~/Library/Logs/it-router.jsonl
+```
+
+`--runaway-guard off` stops the measuring and the extra fields.
 
 ## Two ways to reach Mimir
 

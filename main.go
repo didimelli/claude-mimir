@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -41,8 +42,30 @@ func parseConfig(args []string, getenv func(string) string) (config, error) {
 	fs.StringVar(&cfg.mimirAPI, "mimir-api", api, "which Mimir API to talk to: anthropic (/anthropic, passthrough) or openai (/v1, translated) (default $MIMIR_API or anthropic)")
 	fs.StringVar(&cfg.mimirURL, "mimir-url", "", "Mimir endpoint for the chosen API (default $MIMIR_ANTHROPIC_URL or $MIMIR_OPENAI_URL)")
 	fs.Var(&efforts, "mimir-effort", "model=effort, the reasoning effort sent to Mimir (repeatable; 'none' alone sends nothing; default cubbit/mimir-pro=high on anthropic, cubbit/mimir-pro=medium on openai)")
+	maxText := 24 << 10
+	if v := getenv("IT_MAX_REPLY_TEXT"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return cfg, fmt.Errorf("IT_MAX_REPLY_TEXT %q: want a positive number of bytes", v)
+		}
+		maxText = n
+	}
+	runaway := getenv("IT_RUNAWAY_GUARD")
+	if runaway == "" {
+		runaway = "log"
+	}
+	fs.StringVar(&cfg.runaway, "runaway-guard", runaway, "what to do about a runaway reply (very long text, or one line repeated): log (record it in the request log) or off (default $IT_RUNAWAY_GUARD or log)")
+	fs.IntVar(&cfg.maxReplyText, "max-reply-text", maxText, "visible reply bytes from which a reply counts as a runaway (default $IT_MAX_REPLY_TEXT or 24576)")
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
+	}
+	switch cfg.runaway {
+	case "log", "off":
+	default:
+		return cfg, fmt.Errorf("--runaway-guard %q: want log or off", cfg.runaway)
+	}
+	if cfg.maxReplyText <= 0 {
+		return cfg, fmt.Errorf("--max-reply-text %d: want a positive number of bytes", cfg.maxReplyText)
 	}
 	cfg.prefix = prefixes
 	if len(cfg.prefix) == 0 {

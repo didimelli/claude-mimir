@@ -360,10 +360,39 @@ type oaiStats struct {
 	Usage           oaiUsage
 	HaveUsage       bool
 	ReasoningChunks int
+	Measured        bool       // a streamed reply: Text and Reasoning are meaningful
+	Text            lineWindow // the visible reply, measured (runaway.go)
+	Reasoning       lineWindow // Mimir's reasoning, never forwarded, measured the same way
 	ToolCalls       int
 	LateFragments   int // argument fragments for a tool call already closed (dropped)
 	Truncated       bool
 	StreamError     string // an error Mimir sent inside the stream
+}
+
+func firstNonEmpty(a, b *string) string {
+	if a != nil && *a != "" {
+		return *a
+	}
+	if b != nil {
+		return *b
+	}
+	return ""
+}
+
+// runaway reports why a finished reply looks like a runaway, or "" when it does not: the visible text went past
+// budget bytes, or one line filled runawayThreshold of the last runawayWindow lines of the text or the reasoning.
+func (s *oaiStats) runaway(budget int) string {
+	var why []string
+	if budget > 0 && s.Text.Chars >= budget {
+		why = append(why, "text_budget")
+	}
+	if s.Text.MaxRepeat >= runawayThreshold {
+		why = append(why, "text_repeat")
+	}
+	if s.Reasoning.MaxRepeat >= runawayThreshold {
+		why = append(why, "reasoning_repeat")
+	}
+	return strings.Join(why, ",")
 }
 
 func (s *oaiStats) counts() map[string]int {
@@ -398,6 +427,7 @@ type chatStream struct {
 }
 
 func newChatStream(rc io.ReadCloser, stats *oaiStats) *chatStream {
+	stats.Measured = true
 	return &chatStream{rc: rc, br: bufio.NewReaderSize(rc, 64*1024), stats: stats, open: -1, closed: map[int]bool{}}
 }
 
@@ -471,10 +501,12 @@ func (s *chatStream) handle(data []byte) {
 	s.start(c.ID, c.Model)
 	for _, ch := range c.Choices {
 		d := ch.Delta
-		if (d.Reasoning != nil && *d.Reasoning != "") || (d.ReasoningContent != nil && *d.ReasoningContent != "") {
+		if r := firstNonEmpty(d.Reasoning, d.ReasoningContent); r != "" {
 			s.stats.ReasoningChunks++ // never shown: Mimir's reasoning has no signature Claude Code could replay
+			s.stats.Reasoning.feed(r)
 		}
 		if d.Content != nil && *d.Content != "" {
+			s.stats.Text.feed(*d.Content)
 			if s.openKind != "text" || s.open < 0 {
 				s.openBlock("text", map[string]any{"type": "text", "text": ""})
 			}
@@ -514,6 +546,8 @@ func (s *chatStream) handle(data []byte) {
 
 // end closes the message: the open block, then message_delta with the stop reason and usage, then message_stop.
 func (s *chatStream) end() {
+	s.stats.Text.flush()
+	s.stats.Reasoning.flush()
 	if !s.started {
 		return
 	}
@@ -531,6 +565,8 @@ func (s *chatStream) end() {
 
 // fail ends the stream with an Anthropic error event and no message_stop, so the client sees a failed turn.
 func (s *chatStream) fail(msg string) {
+	s.stats.Text.flush()
+	s.stats.Reasoning.flush()
 	s.stats.StreamError = msg
 	s.emit("error", map[string]any{"type": "error", "error": map[string]string{"type": "api_error", "message": "Mimir: " + msg}})
 	s.done = true

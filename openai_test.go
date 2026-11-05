@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ---- a strict check of an Anthropic Messages SSE stream (what Claude Code's parser expects) --------------------
@@ -467,9 +468,20 @@ func TestTranslateOpenAIError(t *testing.T) {
 
 func newOpenAIRig(t *testing.T, mimirH http.HandlerFunc) *rig {
 	t.Helper()
+	return newOpenAIRigWith(t, mimirH, nil)
+}
+
+// newOpenAIRigWith is newOpenAIRig with a chance to change the gateway's configuration.
+func newOpenAIRigWith(t *testing.T, mimirH http.HandlerFunc, tweak func(*config)) *rig {
+	t.Helper()
 	r := &rig{anth: newFake(t, nil), mimir: newFake(t, mimirH), logPath: filepath.Join(t.TempDir(), "log.jsonl")}
-	g, err := newGateway(config{anthropic: r.anth.URL, logPath: r.logPath, prefix: []string{"cubbit/"},
-		mimirURL: r.mimir.URL + "/v1", mimirKey: "mimir-test-key", mimirAPI: "openai", effort: map[string]string{"cubbit/mimir-pro": "low"}})
+	cfg := config{anthropic: r.anth.URL, logPath: r.logPath, prefix: []string{"cubbit/"},
+		mimirURL: r.mimir.URL + "/v1", mimirKey: "mimir-test-key", mimirAPI: "openai", effort: map[string]string{"cubbit/mimir-pro": "low"},
+		runaway: "log", maxReplyText: 24 << 10}
+	if tweak != nil {
+		tweak(&cfg)
+	}
+	g, err := newGateway(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -570,5 +582,177 @@ func TestParseConfigMimirAPI(t *testing.T) {
 	}
 	if _, err := parseConfig([]string{"--mimir-api", "grpc"}, env(map[string]string{"MIMIR_API_KEY": "k"})); err == nil {
 		t.Error("unknown API accepted")
+	}
+}
+
+// ---- runaway telemetry ---------------------------------------------------------------------------------------
+
+// loopStream is a reply that deliberates in the reasoning, then prints one line over and over.
+func loopStream(reasoningLines, textLines int, line string) string {
+	var b strings.Builder
+	b.WriteString(oaiChunk(`{"role":"assistant","content":""}`, ""))
+	for i := 0; i < reasoningLines; i++ {
+		b.WriteString(oaiChunk(`{"reasoning":"hmm\n"}`, ""))
+	}
+	for i := 0; i < textLines; i++ {
+		b.WriteString(oaiChunk(fmt.Sprintf(`{"content":%q}`, line+"\n"), ""))
+	}
+	b.WriteString(oaiChunk(`{}`, "length"))
+	b.WriteString(oaiUsageChunk)
+	b.WriteString("data: [DONE]\n\n")
+	return b.String()
+}
+
+func TestChatStreamMeasuresTextAndReasoning(t *testing.T) {
+	out, st, err := translateStream(t, strings.NewReader(loopStream(35, 40, "---")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkAnthStream(t, out)
+	if !st.Measured || st.Text.Chars != 160 || st.Text.MaxRepeat != 40 || st.Reasoning.Chars != 35*4 || st.Reasoning.MaxRepeat != 35 {
+		t.Fatalf("measured %v text %d/%d reasoning %d/%d", st.Measured, st.Text.Chars, st.Text.MaxRepeat, st.Reasoning.Chars, st.Reasoning.MaxRepeat)
+	}
+	if got := st.runaway(1 << 20); got != "text_repeat,reasoning_repeat" {
+		t.Fatalf("runaway %q", got)
+	}
+	if got := st.runaway(100); got != "text_budget,text_repeat,reasoning_repeat" {
+		t.Fatalf("runaway with a 100-byte budget %q", got)
+	}
+	_, ok, _ := translateStream(t, strings.NewReader(parallelToolStream()))
+	if got := ok.runaway(1 << 20); got != "" || ok.Text.Chars != 0 {
+		t.Fatalf("a healthy reply was flagged: %q", got)
+	}
+}
+
+func TestChatStreamMeasuresIndependentlyOfChunking(t *testing.T) {
+	in := []byte(loopStream(35, 40, "---"))
+	want, _, _ := translateStream(t, bytes.NewReader(in))
+	for seed := int64(0); seed < 50; seed++ {
+		got, st, err := translateStream(t, &smallReader{append([]byte(nil), in...), rand.New(rand.NewSource(seed))})
+		if err != nil || !bytes.Equal(got, want) || st.Text.MaxRepeat != 40 || st.Reasoning.Chars != 140 {
+			t.Fatalf("seed %d: %v %d %d", seed, err, st.Text.MaxRepeat, st.Reasoning.Chars)
+		}
+	}
+}
+
+func TestGatewayLogsRunawayWithoutText(t *testing.T) {
+	const loopLine = "LOOP-LINE-do-not-log"
+	r := newOpenAIRig(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(loopStream(0, 45, loopLine)))
+	})
+	if resp, b := r.post(t, "/v1/messages", convo(true)); resp.StatusCode != 200 {
+		t.Fatalf("%d %s", resp.StatusCode, b)
+	}
+	lg := r.logs(t)
+	if len(lg) != 1 || lg[0]["runaway"] != "text_repeat" || lg[0]["text_max_repeat"] != 45.0 || lg[0]["text_chars"] != float64(45*(len(loopLine)+1)) || lg[0]["reasoning_chars"] != 0.0 {
+		t.Fatalf("log %v", lg)
+	}
+	if strings.Contains(string(mustRead(t, r.logPath)), loopLine) {
+		t.Fatal("reply text reached the log")
+	}
+
+	healthy := newOpenAIRig(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(parallelToolStream()))
+	})
+	healthy.post(t, "/v1/messages", convo(true))
+	if lg := healthy.logs(t); len(lg) != 1 || lg[0]["runaway"] != nil || lg[0]["text_chars"] != 0.0 {
+		t.Fatalf("healthy log %v", lg)
+	}
+}
+
+func TestGatewayRunawayBudgetAndOff(t *testing.T) {
+	long := func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		var b strings.Builder
+		b.WriteString(oaiChunk(`{"role":"assistant","content":""}`, ""))
+		for i := 0; i < 30; i++ { // varied lines: no repetition, only length
+			b.WriteString(oaiChunk(fmt.Sprintf(`{"content":"line %d of a long deliberation\n"}`, i), ""))
+		}
+		b.WriteString(oaiChunk(`{}`, "stop") + oaiUsageChunk + "data: [DONE]\n\n")
+		_, _ = w.Write([]byte(b.String()))
+	}
+	r := newOpenAIRigWith(t, long, func(c *config) { c.maxReplyText = 200 })
+	r.post(t, "/v1/messages", convo(true))
+	if lg := r.logs(t); len(lg) != 1 || lg[0]["runaway"] != "text_budget" || lg[0]["text_max_repeat"] != 1.0 {
+		t.Fatalf("budget log %v", lg)
+	}
+	off := newOpenAIRigWith(t, long, func(c *config) { c.runaway = "off"; c.maxReplyText = 200 })
+	off.post(t, "/v1/messages", convo(true))
+	lg := off.logs(t)
+	if len(lg) != 1 || lg[0]["runaway"] != nil || lg[0]["text_chars"] != nil || lg[0]["reasoning_chars"] != nil {
+		t.Fatalf("off must add nothing to the log: %v", lg)
+	}
+}
+
+func TestParseConfigRunaway(t *testing.T) {
+	env := func(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
+	base := map[string]string{"MIMIR_API_KEY": "k", "MIMIR_ANTHROPIC_URL": "https://m/anthropic"}
+	with := func(extra map[string]string) map[string]string {
+		m := map[string]string{}
+		for k, v := range base {
+			m[k] = v
+		}
+		for k, v := range extra {
+			m[k] = v
+		}
+		return m
+	}
+	cfg, err := parseConfig(nil, env(base))
+	if err != nil || cfg.runaway != "log" || cfg.maxReplyText != 24<<10 {
+		t.Fatalf("defaults: %q %d %v", cfg.runaway, cfg.maxReplyText, err)
+	}
+	cfg, err = parseConfig(nil, env(with(map[string]string{"IT_RUNAWAY_GUARD": "off", "IT_MAX_REPLY_TEXT": "1000"})))
+	if err != nil || cfg.runaway != "off" || cfg.maxReplyText != 1000 {
+		t.Fatalf("environment: %q %d %v", cfg.runaway, cfg.maxReplyText, err)
+	}
+	cfg, err = parseConfig([]string{"--runaway-guard", "log", "--max-reply-text", "500"}, env(with(map[string]string{"IT_RUNAWAY_GUARD": "off"})))
+	if err != nil || cfg.runaway != "log" || cfg.maxReplyText != 500 {
+		t.Fatalf("flags beat the environment: %q %d %v", cfg.runaway, cfg.maxReplyText, err)
+	}
+	for _, bad := range [][]string{{"--runaway-guard", "cut"}, {"--runaway-guard", "banana"}, {"--max-reply-text", "0"}, {"--max-reply-text", "-5"}} {
+		if _, err := parseConfig(bad, env(base)); err == nil {
+			t.Errorf("%v accepted", bad)
+		}
+	}
+	if _, err := parseConfig(nil, env(with(map[string]string{"IT_MAX_REPLY_TEXT": "lots"}))); err == nil {
+		t.Error("a non-numeric IT_MAX_REPLY_TEXT was accepted")
+	}
+}
+
+func TestChatStreamCountsATrailingLineWithoutNewline(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(oaiChunk(`{"role":"assistant","content":""}`, ""))
+	for i := 0; i < 29; i++ {
+		b.WriteString(oaiChunk(`{"content":"same\n"}`, ""))
+	}
+	b.WriteString(oaiChunk(`{"content":"same"}`, "stop")) // the reply ends in the middle of the 30th line
+	b.WriteString(oaiUsageChunk + "data: [DONE]\n\n")
+	_, st, err := translateStream(t, strings.NewReader(b.String()))
+	if err != nil || st.Text.MaxRepeat != 30 {
+		t.Fatalf("repeat %d, want 30 (%v)", st.Text.MaxRepeat, err)
+	}
+}
+
+func TestLogCarriesLocalAndUTCTimestamps(t *testing.T) {
+	r := newOpenAIRig(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(parallelToolStream()))
+	})
+	r.post(t, "/v1/messages", convo(true))
+	lg := r.logs(t)
+	if len(lg) != 1 {
+		t.Fatalf("log %v", lg)
+	}
+	utc, err := time.Parse(time.RFC3339, fmt.Sprint(lg[0]["ts_utc"]))
+	if err != nil || !strings.HasSuffix(fmt.Sprint(lg[0]["ts_utc"]), "Z") {
+		t.Fatalf("ts_utc %v: %v", lg[0]["ts_utc"], err)
+	}
+	if time.Since(utc) > time.Minute || time.Until(utc) > time.Minute {
+		t.Fatalf("ts_utc %v is not now", utc)
+	}
+	if want := utc.In(time.Local).Format("2006-01-02T15:04:05"); lg[0]["ts"] != want {
+		t.Fatalf("ts %v is not ts_utc in local time (%s)", lg[0]["ts"], want)
 	}
 }
