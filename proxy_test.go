@@ -458,7 +458,7 @@ func TestGatewaySendsConfiguredEffortPerModel(t *testing.T) {
 func TestParseConfigMimirEffort(t *testing.T) {
 	env := func(map[string]string) func(string) string {
 		return func(k string) string {
-			if k == "MIMIR_API" {
+			if k == "MIMIR_API" || strings.HasPrefix(k, "IT_") {
 				return ""
 			}
 			return "k"

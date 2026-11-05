@@ -23,6 +23,8 @@ type config struct {
 	port                                         int
 	prefix                                       []string
 	effort                                       map[string]string // request model -> reasoning effort sent to Mimir
+	runaway                                      string            // "log" (default) or "off": measure runaway replies in the request log
+	maxReplyText                                 int               // visible reply bytes from which a reply counts as a runaway
 }
 
 type gateway struct {
@@ -83,6 +85,13 @@ func (ri *reqInfo) finish() {
 				ri.rec["input_tokens"], ri.rec["output_tokens"] = s.Usage.PromptTokens, s.Usage.CompletionTokens
 			}
 			ri.rec["reasoning_chunks"], ri.rec["tool_calls"] = s.ReasoningChunks, s.ToolCalls
+			if s.Measured && ri.g.cfg.runaway != "off" {
+				ri.rec["text_chars"], ri.rec["reasoning_chars"] = s.Text.Chars, s.Reasoning.Chars
+				ri.rec["text_max_repeat"], ri.rec["reasoning_max_repeat"] = s.Text.MaxRepeat, s.Reasoning.MaxRepeat
+				if why := s.runaway(ri.g.cfg.maxReplyText); why != "" {
+					ri.rec["runaway"] = why
+				}
+			}
 			if c := s.counts(); len(c) > 0 {
 				ri.rec["stream_fixes"] = c
 			}
