@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ---- a strict check of an Anthropic Messages SSE stream (what Claude Code's parser expects) --------------------
@@ -731,5 +732,27 @@ func TestChatStreamCountsATrailingLineWithoutNewline(t *testing.T) {
 	_, st, err := translateStream(t, strings.NewReader(b.String()))
 	if err != nil || st.Text.MaxRepeat != 30 {
 		t.Fatalf("repeat %d, want 30 (%v)", st.Text.MaxRepeat, err)
+	}
+}
+
+func TestLogCarriesLocalAndUTCTimestamps(t *testing.T) {
+	r := newOpenAIRig(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(parallelToolStream()))
+	})
+	r.post(t, "/v1/messages", convo(true))
+	lg := r.logs(t)
+	if len(lg) != 1 {
+		t.Fatalf("log %v", lg)
+	}
+	utc, err := time.Parse(time.RFC3339, fmt.Sprint(lg[0]["ts_utc"]))
+	if err != nil || !strings.HasSuffix(fmt.Sprint(lg[0]["ts_utc"]), "Z") {
+		t.Fatalf("ts_utc %v: %v", lg[0]["ts_utc"], err)
+	}
+	if time.Since(utc) > time.Minute || time.Until(utc) > time.Minute {
+		t.Fatalf("ts_utc %v is not now", utc)
+	}
+	if want := utc.In(time.Local).Format("2006-01-02T15:04:05"); lg[0]["ts"] != want {
+		t.Fatalf("ts %v is not ts_utc in local time (%s)", lg[0]["ts"], want)
 	}
 }

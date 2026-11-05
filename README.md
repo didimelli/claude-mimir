@@ -130,7 +130,7 @@ Everything comes from the environment. `deploy/run.sh` (what launchd runs) first
 - **Rollback:** restore `it-router` and `run.sh` from the latest backup directory, then restart.
 - **Logs:**
   - `~/Library/Logs/it-router.log` is the process output.
-  - `~/Library/Logs/it-router.jsonl` has one line per `/v1/messages` request: route, model, status, `upstream_host`, ttfb and total ms, message and tool counts, `orphan_tool_results`, `first_hash`, the upstream `request_id`. On the Mimir leg it also has `folded`, `dropped_fields`, `effort` and `stream_fixes`; with `openai`, also `mimir_api`, `input_tokens`, `output_tokens` (real, from Mimir), `tool_calls` and `reasoning_chunks`; for streamed replies also `text_chars`, `reasoning_chars`, `text_max_repeat`, `reasoning_max_repeat` and, when the reply looks like a runaway, `runaway`.
+  - `~/Library/Logs/it-router.jsonl` has one line per `/v1/messages` request: `ts` (local time, no offset) and `ts_utc` (UTC, RFC 3339), route, model, status, `upstream_host`, ttfb and total ms, message and tool counts, `orphan_tool_results`, `first_hash`, the upstream `request_id`. On the Mimir leg it also has `folded`, `dropped_fields`, `effort` and `stream_fixes`; with `openai`, also `mimir_api`, `input_tokens`, `output_tokens` (real, from Mimir), `tool_calls` and `reasoning_chunks`; for streamed replies also `text_chars`, `reasoning_chars`, `text_max_repeat`, `reasoning_max_repeat` and, when the reply looks like a runaway, `runaway`.
   - `error: client went away` means the client left before the response was complete.
 
 ## Runaway replies

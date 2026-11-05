@@ -359,7 +359,7 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	ri := &reqInfo{g: g, route: route, start: time.Now(), logIt: shape != nil}
 	ri.rec = map[string]any{
-		"ts": time.Now().Format("2006-01-02T15:04:05"), "route": route, "method": r.Method, "path": path, "model": nilIfEmpty(model),
+		"ts": ri.start.Format("2006-01-02T15:04:05"), "ts_utc": ri.start.UTC().Format(time.RFC3339), "route": route, "method": r.Method, "path": path, "model": nilIfEmpty(model),
 		"req_bytes": len(body), "session": nilIfEmpty(r.Header.Get("X-Claude-Code-Session-Id")),
 		"request_class": nilIfEmpty(r.Header.Get("X-Claude-Code-Request-Class")), "agent": nilIfEmpty(r.Header.Get("X-Claude-Code-Agent-Type")),
 	}
