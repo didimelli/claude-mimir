@@ -317,7 +317,12 @@ func TestChatStreamIndependentOfChunking(t *testing.T) {
 
 func chatReq(t *testing.T, body string, effort string) (map[string]any, oaiInfo) {
 	t.Helper()
-	out, info, err := toChatCompletions([]byte(body), effort)
+	return chatReqReplay(t, body, effort, nil)
+}
+
+func chatReqReplay(t *testing.T, body string, effort string, replay map[string]any) (map[string]any, oaiInfo) {
+	t.Helper()
+	out, info, err := toChatCompletions([]byte(body), effort, replay)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -413,6 +418,67 @@ func TestToChatCompletionsToolChoiceAndDefaults(t *testing.T) {
 		if _, ok := m[k]; ok {
 			t.Errorf("%s set without being asked for", k)
 		}
+	}
+}
+
+const thinkingTurn = `{"model":"cubbit/mimir","messages":[
+	  {"role":"user","content":"task"},
+	  {"role":"assistant","content":[{"type":"thinking","thinking":"first","signature":"s"},{"type":"redacted_thinking","data":"x"},
+	   {"type":"thinking","thinking":"second","signature":"s"},{"type":"text","text":"reading"},{"type":"tool_use","id":"t1","name":"Read","input":{}}]},
+	  {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"A"}]}]`
+
+func TestToChatCompletionsReplaysThinking(t *testing.T) {
+	m, info := chatReqReplay(t, thinkingTurn+`}`, "", map[string]any{"preserve_thinking": true})
+	a := m["messages"].([]any)[1].(map[string]any)
+	if a["reasoning_content"] != "first\nsecond" || a["content"] != "reading" || len(a["tool_calls"].([]any)) != 1 {
+		t.Errorf("assistant %v", a)
+	}
+	if info.Replayed != 2 || info.DroppedBlocks != 1 { // redacted_thinking is still dropped
+		t.Errorf("replayed %d dropped %d", info.Replayed, info.DroppedBlocks)
+	}
+	if fmt.Sprint(m["chat_template_kwargs"]) != "map[preserve_thinking:true]" {
+		t.Errorf("kwargs %v", m["chat_template_kwargs"])
+	}
+
+	// mimir-slim: no replay, thinking dropped as before.
+	m, info = chatReq(t, thinkingTurn+`}`, "high")
+	a = m["messages"].([]any)[1].(map[string]any)
+	if _, ok := a["reasoning_content"]; ok || info.Replayed != 0 || info.DroppedBlocks != 3 {
+		t.Errorf("slim assistant %v replayed %d dropped %d", a, info.Replayed, info.DroppedBlocks)
+	}
+	if _, ok := m["chat_template_kwargs"]; ok {
+		t.Errorf("kwargs sent without replay: %v", m["chat_template_kwargs"])
+	}
+}
+
+func TestToChatCompletionsMergesTemplateKwargs(t *testing.T) {
+	body := thinkingTurn + `,"chat_template_kwargs":{"enable_thinking":true,"clear_thinking":true}}`
+	m, _ := chatReqReplay(t, body, "", map[string]any{"clear_thinking": false, "extra": 1})
+	if fmt.Sprint(m["chat_template_kwargs"]) != "map[clear_thinking:true enable_thinking:true extra:1]" {
+		t.Errorf("kwargs %v", m["chat_template_kwargs"])
+	}
+}
+
+func TestGatewayOpenAIReplaysThinkingPerModel(t *testing.T) {
+	r := newOpenAIRigWith(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"x","model":"m","choices":[{"finish_reason":"stop","message":{"content":"ok"}}]}`))
+	}, func(c *config) {
+		c.effort = map[string]string{"cubbit/mimir": "medium", "cubbit/mimir-slim": "high"}
+		c.replay = map[string]map[string]any{"cubbit/mimir": {"preserve_thinking": true}}
+	})
+	for _, model := range []string{"cubbit/mimir", "cubbit/mimir-slim"} {
+		r.post(t, "/v1/messages", []byte(strings.Replace(thinkingTurn+`}`, "cubbit/mimir", model, 1)))
+		var sent map[string]any
+		_ = json.Unmarshal(r.mimir.last(t).body, &sent)
+		a := sent["messages"].([]any)[1].(map[string]any)
+		replayed := a["reasoning_content"] == "first\nsecond"
+		if replayed != (model == "cubbit/mimir") || sent["reasoning_effort"] != map[string]string{"cubbit/mimir": "medium", "cubbit/mimir-slim": "high"}[model] {
+			t.Errorf("%s sent %v", model, sent)
+		}
+	}
+	lg := r.logs(t)
+	if len(lg) != 2 || lg[0]["replayed_thinking"] != 2.0 || lg[0]["dropped_blocks"] != 1.0 || lg[1]["replayed_thinking"] != nil || lg[1]["dropped_blocks"] != 3.0 {
+		t.Errorf("log %v", lg)
 	}
 }
 
@@ -567,7 +633,9 @@ func TestGatewayOpenAINonStreamAndErrors(t *testing.T) {
 func TestParseConfigMimirAPI(t *testing.T) {
 	env := func(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
 	cfg, err := parseConfig([]string{"--mimir-api", "openai"}, env(map[string]string{"MIMIR_API_KEY": "k", "MIMIR_OPENAI_URL": "https://m/v1/"}))
-	if err != nil || cfg.mimirAPI != "openai" || cfg.mimirURL != "https://m/v1" || len(cfg.effort) != 1 || cfg.effort["cubbit/mimir-pro"] != "medium" {
+	if err != nil || cfg.mimirAPI != "openai" || cfg.mimirURL != "https://m/v1" ||
+		fmt.Sprint(cfg.effort) != "map[cubbit/mimir:medium cubbit/mimir-pro:high cubbit/mimir-slim:high]" ||
+		fmt.Sprint(cfg.replay) != "map[cubbit/mimir:map[preserve_thinking:true] cubbit/mimir-pro:map[clear_thinking:false]]" {
 		t.Fatalf("%+v %v", cfg, err)
 	}
 	cfg, err = parseConfig([]string{"--mimir-effort", "cubbit/mimir-pro=none"}, env(map[string]string{"MIMIR_API": "openai", "MIMIR_API_KEY": "k", "MIMIR_OPENAI_URL": "https://m/v1"}))

@@ -22,9 +22,10 @@ type config struct {
 	mimirAPI                                     string // "anthropic" (mimirURL is Mimir's /anthropic) or "openai" (mimirURL is its /v1)
 	port                                         int
 	prefix                                       []string
-	effort                                       map[string]string // request model -> reasoning effort sent to Mimir
-	runaway                                      string            // "log" (default) or "off": measure runaway replies in the request log
-	maxReplyText                                 int               // visible reply bytes from which a reply counts as a runaway
+	effort                                       map[string]string         // request model -> reasoning effort sent to Mimir
+	replay                                       map[string]map[string]any // openai: model -> chat_template_kwargs; listed models get earlier thinking replayed
+	runaway                                      string                    // "log" (default) or "off": measure runaway replies in the request log
+	maxReplyText                                 int                       // visible reply bytes from which a reply counts as a runaway
 }
 
 type gateway struct {
@@ -376,7 +377,7 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if g.cfg.mimirAPI == "openai" {
 			ri.rec["mimir_api"] = "openai"
-			translated, info, err := toChatCompletions(src, g.cfg.effort[model])
+			translated, info, err := toChatCompletions(src, g.cfg.effort[model], g.cfg.replay[model])
 			if err != nil {
 				ri.status = http.StatusBadRequest
 				ri.errMsg = "untranslatable request: " + err.Error()
@@ -389,6 +390,9 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				ri.rec["effort"] = info.Effort
 			}
 			ri.rec["folded"], ri.rec["dropped_blocks"], ri.rec["hoisted"] = info.Folded, info.foldStats.DroppedBlocks+info.DroppedBlocks, info.Hoisted
+			if info.Replayed > 0 {
+				ri.rec["replayed_thinking"] = info.Replayed
+			}
 			if info.DroppedTools > 0 {
 				ri.rec["dropped_tools"] = info.DroppedTools
 			}

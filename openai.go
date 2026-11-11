@@ -29,6 +29,7 @@ type oaiInfo struct {
 	foldStats
 	Effort        string
 	DroppedBlocks int // content blocks with no Chat Completions equivalent (thinking, documents, server tools, ...)
+	Replayed      int // thinking blocks sent back as reasoning_content
 	DroppedTools  int // server tools without an input schema
 }
 
@@ -37,6 +38,9 @@ type oaiMessage struct {
 	Content    any           `json:"content"`
 	ToolCalls  []oaiToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string        `json:"tool_call_id,omitempty"`
+	// ReasoningContent is the turn's earlier reasoning, for chat templates that keep it (Qwen preserve_thinking,
+	// GLM clear_thinking=false).
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 type oaiToolCall struct {
@@ -51,6 +55,7 @@ type oaiToolCall struct {
 type anthBlock struct {
 	Type      string          `json:"type"`
 	Text      string          `json:"text"`
+	Thinking  string          `json:"thinking"`
 	ID        string          `json:"id"`
 	Name      string          `json:"name"`
 	Input     json.RawMessage `json:"input"`
@@ -129,7 +134,9 @@ func toolResultText(b anthBlock) (string, []map[string]any) {
 
 // toChatCompletions translates an Anthropic Messages request into a Chat Completions request. Mid-conversation
 // system entries are folded first, exactly as on the /anthropic path (mimir-slim rejects them on /v1 too).
-func toChatCompletions(body []byte, effort string) ([]byte, oaiInfo, error) {
+// A non-nil replay sends earlier assistant thinking back as reasoning_content and merges replay into
+// chat_template_kwargs; nil drops thinking, as before.
+func toChatCompletions(body []byte, effort string, replay map[string]any) ([]byte, oaiInfo, error) {
 	var info oaiInfo
 	var req struct {
 		Model      string            `json:"model"`
@@ -146,6 +153,7 @@ func toChatCompletions(body []byte, effort string) ([]byte, oaiInfo, error) {
 		Temperature   json.RawMessage `json:"temperature"`
 		TopP          json.RawMessage `json:"top_p"`
 		StopSequences []string        `json:"stop_sequences"`
+		Kwargs        map[string]any  `json:"chat_template_kwargs"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil, info, err
@@ -168,11 +176,18 @@ func toChatCompletions(body []byte, effort string) ([]byte, oaiInfo, error) {
 		switch roleOf(m) {
 		case "assistant":
 			am := oaiMessage{Role: "assistant"}
-			var texts []string
+			var texts, thoughts []string
 			for _, b := range blocks {
 				switch b.Type {
 				case "text":
 					texts = append(texts, b.Text)
+				case "thinking":
+					if replay == nil {
+						info.DroppedBlocks++
+						continue
+					}
+					thoughts = append(thoughts, b.Thinking)
+					info.Replayed++
 				case "tool_use":
 					tc := oaiToolCall{ID: b.ID, Type: "function"}
 					tc.Function.Name = b.Name
@@ -181,10 +196,11 @@ func toChatCompletions(body []byte, effort string) ([]byte, oaiInfo, error) {
 						tc.Function.Arguments = string(b.Input)
 					}
 					am.ToolCalls = append(am.ToolCalls, tc)
-				default: // thinking, redacted_thinking, server tool blocks
+				default: // redacted_thinking, server tool blocks
 					info.DroppedBlocks++
 				}
 			}
+			am.ReasoningContent = strings.Join(thoughts, "\n")
 			am.Content = strings.Join(texts, "\n\n")
 			if len(texts) == 0 && len(am.ToolCalls) > 0 {
 				am.Content = nil
@@ -271,6 +287,17 @@ func toChatCompletions(body []byte, effort string) ([]byte, oaiInfo, error) {
 	if effort != "" {
 		creq["reasoning_effort"] = effort
 		info.Effort = effort
+	}
+	if req.Kwargs == nil && replay != nil {
+		req.Kwargs = map[string]any{}
+	}
+	for k, v := range replay {
+		if _, set := req.Kwargs[k]; !set { // the client's own value wins
+			req.Kwargs[k] = v
+		}
+	}
+	if len(req.Kwargs) > 0 {
+		creq["chat_template_kwargs"] = req.Kwargs
 	}
 	return marshal(creq), info, nil
 }
