@@ -100,6 +100,73 @@ Restart Claude Code once after adding agents, so a running session sees them.
 - `mimir-pro` sometimes spends a whole turn reasoning without producing anything. Claude Code then reports "Output token limit hit" and continues; see the notes below.
 - A bigger pattern that works well: a Mimir implementer subagent that writes the code test-first, and fresh Claude subagents that review it in rounds. Mimir does the volume of the work, and Claude keeps the judgement.
 
+## Headroom (optional, experimental)
+
+[Headroom](https://github.com/headroomlabs-ai/headroom) is a local proxy that compresses prompts (mostly large tool results) before they reach the model. It works in front of both plain `claude` and `claude-mimir`. Nothing in this repo depends on it and nothing here starts it: you run it yourself, and only sessions you point at it use it.
+
+```
+plain claude  --> headroom :8787 --> api.anthropic.com
+claude-mimir  --> headroom :8788 --> it-router :4000 --+--> cubbit/*   --> Mimir
+                                                       +--> the rest  --> api.anthropic.com
+```
+
+For `claude-mimir`, Headroom sits in front of the gateway, so it compresses Mimir requests too. It works on the Anthropic-format request, before the gateway translates it for `/v1` (`MIMIR_API=openai`).
+
+**Install**
+
+```sh
+uv tool install --python 3.13 "headroom-ai[all]"
+headroom --version
+```
+
+**Launch the two proxies**
+
+```sh
+export HEADROOM_TELEMETRY=off HEADROOM_BEACON=off DO_NOT_TRACK=1
+
+# plain claude: Headroom straight to Anthropic
+nohup headroom proxy --port 8787 --no-subscription-tracking \
+  --protect-tool-results Read,Edit,Write,Bash > ~/Library/Logs/headroom-8787.log 2>&1 &
+
+# claude-mimir: Headroom in front of it-router
+ANTHROPIC_TARGET_API_URL=http://127.0.0.1:4000 \
+nohup headroom proxy --port 8788 --no-subscription-tracking \
+  --protect-tool-results Read,Edit,Write,Bash > ~/Library/Logs/headroom-8788.log 2>&1 &
+
+curl -s http://127.0.0.1:8787/livez; curl -s http://127.0.0.1:8788/livez
+```
+
+- `ANTHROPIC_TARGET_API_URL` is how the second proxy forwards to the gateway instead of `api.anthropic.com`. It is read from the environment, and `headroom proxy --help` does not list it.
+- `--protect-tool-results` keeps compression away from file reads and command output, which an agent that edits code needs exact. `--no-subscription-tracking` stops Headroom's own usage polling.
+- The proxies bind `127.0.0.1` only. They are plain background processes: nothing restarts them and they do not survive a reboot. The gateway must already be running for the `8788` chain.
+- Stop them with `pkill -f "headroom.cli proxy"`. `pkill -f "headroom proxy"` matches nothing, because the process runs as `python -m headroom.cli proxy`.
+
+**Opt in per session**
+
+Set the base URL on the command line:
+
+```sh
+ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
+```
+
+For `claude-mimir`, the launcher hardcodes `:4000`, so its `export` would override a variable set on the command line. Run Claude Code directly with the same settings the launcher uses:
+
+```sh
+env -u ANTHROPIC_CUSTOM_HEADERS \
+  ANTHROPIC_BASE_URL=http://127.0.0.1:8788 \
+  CLAUDE_CODE_MAX_CONTEXT_TOKENS=1048576 \
+  claude
+```
+
+As in [Usage](#usage), don't put `ANTHROPIC_BASE_URL` in the `env` block of `~/.claude/settings.json`. Sessions started without the variable are unaffected.
+
+**Check it**
+
+- `headroom savings`, or `PERF` lines (`tok_before`, `tok_after`, `tok_saved`) in the proxy logs.
+- `~/Library/Logs/it-router.jsonl` still shows `"route":"mimir"` for subagents and `"route":"anthropic"` for the main conversation.
+
+**What was tested, and what was not.** Checked with Headroom 0.44.0: a non-streaming Mimir request with a large tool result (about 23k to 17k tokens), a streamed tool call and a streamed follow-up on `/v1`, and a `claude -p` turn with the Claude subscription login through both chains. Not tested: a long agent session, whether `--protect-tool-results` keeps an implementer's file reads exact, and Headroom's extra tool injection (a small request cost about 130 more input tokens through it). Compression also adds latency, several seconds on large payloads.
+
 ## Configuration
 
 Everything comes from the environment. `deploy/run.sh` (what launchd runs) first reads `~/.config/it-gateway/env` if it exists, because launchd passes almost no environment.
