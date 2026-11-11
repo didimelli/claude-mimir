@@ -322,7 +322,7 @@ func chatReq(t *testing.T, body string, effort string) (map[string]any, oaiInfo)
 
 func chatReqReplay(t *testing.T, body string, effort string, replay map[string]any) (map[string]any, oaiInfo) {
 	t.Helper()
-	out, info, err := toChatCompletions([]byte(body), effort, replay)
+	out, info, err := toChatCompletions([]byte(body), effort, replay, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -485,7 +485,9 @@ func TestGatewayOpenAIReplaysThinkingPerModel(t *testing.T) {
 // ---- non-streamed replies and errors -------------------------------------------------------------------------
 
 func TestFromChatCompletion(t *testing.T) {
-	out, u, err := fromChatCompletion([]byte(`{"id":"c9","model":"mimir-slim","choices":[{"finish_reason":"tool_calls","message":{"content":"ok","reasoning":"secret","tool_calls":[{"id":"x1","type":"function","function":{"name":"f","arguments":"{\"a\":1}"}},{"id":"x2","type":"function","function":{"name":"g","arguments":"not json"}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":4}}`))
+	var st oaiStats
+	out, err := fromChatCompletion([]byte(`{"id":"c9","model":"mimir-slim","choices":[{"finish_reason":"tool_calls","message":{"content":"ok","reasoning":"secret","tool_calls":[{"id":"x1","type":"function","function":{"name":"f","arguments":"{\"a\":1}"}},{"id":"x2","type":"function","function":{"name":"g","arguments":"not json"}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":4}}`), &st)
+	u := st.Usage
 	if err != nil {
 		t.Fatal(err)
 	}
