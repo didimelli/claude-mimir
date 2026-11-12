@@ -76,7 +76,10 @@ func toolTurn2(model, id string) []byte {
 	 {"role":"user","content":[{"type":"tool_result","tool_use_id":"` + id + `","content":"A"}]}]}`)
 }
 
-func cacheRig(t *testing.T, stream bool) *rig {
+func cacheRig(t *testing.T, stream bool) *rig { return cacheRigFinish(t, stream, "tool_calls") }
+
+// cacheRigFinish answers turn 1 with reasoning and one tool call, then finish.
+func cacheRigFinish(t *testing.T, stream bool, finish string) *rig {
 	return newOpenAIRigWith(t, func(w http.ResponseWriter, _ *http.Request) {
 		if stream {
 			w.Header().Set("Content-Type", "text/event-stream")
@@ -84,10 +87,10 @@ func cacheRig(t *testing.T, stream bool) *rig {
 				`data: {"id":"c1","model":"m","choices":[{"delta":{"reasoning_content":"the key is "}}]}` + "\n\n" +
 					`data: {"id":"c1","model":"m","choices":[{"delta":{"reasoning_content":"42"}}]}` + "\n\n" +
 					`data: {"id":"c1","model":"m","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"Read","arguments":"{}"}}]}}]}` + "\n\n" +
-					`data: {"id":"c1","model":"m","choices":[{"delta":{},"finish_reason":"tool_calls"}]}` + "\n\ndata: [DONE]\n\n"))
+					`data: {"id":"c1","model":"m","choices":[{"delta":{},"finish_reason":"` + finish + `"}]}` + "\n\ndata: [DONE]\n\n"))
 			return
 		}
-		_, _ = w.Write([]byte(`{"id":"c1","model":"m","choices":[{"finish_reason":"tool_calls","message":{"content":null,"reasoning":"the key is 42",
+		_, _ = w.Write([]byte(`{"id":"c1","model":"m","choices":[{"finish_reason":"` + finish + `","message":{"content":null,"reasoning":"the key is 42",
 		 "tool_calls":[{"id":"call_1","type":"function","function":{"name":"Read","arguments":"{}"}}]}}]}`))
 	}, func(c *config) {
 		c.replay = map[string]map[string]any{"cubbit/mimir": {"preserve_thinking": true}, "cubbit/mimir-pro": {"clear_thinking": false}}
@@ -127,6 +130,25 @@ func TestGatewayCachesReasoningAcrossTurns(t *testing.T) {
 		}
 		lg := r.logs(t)
 		if lg[0]["reasoning_cached"] != 1.0 || lg[1]["reasoning_injected"] != 1.0 || lg[2]["reasoning_injected"] != nil || lg[3]["reasoning_injected"] != nil {
+			t.Errorf("stream=%v: log %v", stream, lg)
+		}
+	}
+}
+
+// A reply cut off at max_tokens has half-finished reasoning: replaying it would mislead the next turn.
+func TestGatewayNeverCachesCutOffReasoning(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		r := cacheRigFinish(t, stream, "length")
+		body := []byte(toolTurn1)
+		if stream {
+			body = []byte(strings.Replace(toolTurn1, `"messages"`, `"stream":true,"messages"`, 1))
+		}
+		r.post(t, "/v1/messages", body)
+		r.post(t, "/v1/messages", toolTurn2("cubbit/mimir", "call_1"))
+		if a := sentAssistant(t, r); a["reasoning_content"] != nil {
+			t.Errorf("stream=%v: cut-off reasoning injected %v", stream, a)
+		}
+		if lg := r.logs(t); lg[0]["reasoning_cached"] != nil || lg[1]["reasoning_injected"] != nil {
 			t.Errorf("stream=%v: log %v", stream, lg)
 		}
 	}
