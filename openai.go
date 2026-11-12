@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Reasoning efforts each API accepts. /anthropic validates them per model (slim rejects high and max, mimir rejects
@@ -490,7 +491,14 @@ type chatStream struct {
 	onEnd   func()          // non-nil: collect reasoning and tool call ids, set stats.Thought, then call it at the end
 	thought strings.Builder // collected reasoning, up to reasonMaxBytes+1
 	ids     []string
+
+	pinged time.Time // last SSE ping, so a long reasoning phase is not silent toward the client
 }
+
+// pingEvery bounds how silent the client-facing stream may be while Mimir is reasoning. Claude Code aborts a stream
+// that sends it nothing for a few minutes ("Waiting for API response · will retry …"); the pings are the only thing
+// it gets during that window, because Mimir's reasoning is not forwarded.
+const pingEvery = 5 * time.Second
 
 func newChatStream(rc io.ReadCloser, stats *oaiStats) *chatStream {
 	stats.Measured = true
@@ -572,6 +580,10 @@ func (s *chatStream) handle(data []byte) {
 			s.stats.Reasoning.feed(r)
 			if s.onEnd != nil && s.thought.Len() <= reasonMaxBytes {
 				s.thought.WriteString(r)
+			}
+			if time.Since(s.pinged) >= pingEvery {
+				s.pinged = time.Now()
+				s.emit("ping", map[string]string{"type": "ping"})
 			}
 		}
 		if d.Content != nil && *d.Content != "" {

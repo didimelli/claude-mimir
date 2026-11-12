@@ -110,6 +110,7 @@ func checkAnthStream(t *testing.T, raw []byte) streamResult {
 				t.Fatalf("tool input is not JSON: %s", acc[i].String())
 			}
 			open = -1
+		case "ping": // the real Anthropic API sends these; Mimir's reasoning can take minutes, hidden from the client
 		case "message_delta":
 			if open != -1 {
 				t.Fatalf("message_delta while block %d open", open)
@@ -223,6 +224,35 @@ func TestChatStreamTextThenToolAndFinishes(t *testing.T) {
 				t.Fatalf("stop %q blocks %v", res.stopReason, res.blocks)
 			}
 		})
+	}
+}
+
+// A long reasoning phase is invisible to the client: without SSE pings the stream to Claude Code is silent for
+// minutes and the client aborts ("Waiting for API response · will retry"). Exactly one ping must go out, and it
+// must not leak the reasoning.
+func TestChatStreamPingsDuringReasoning(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(oaiChunk(`{"reasoning":"I should consider "}`, ""))
+	b.WriteString(oaiChunk(`{"reasoning":"many things at length"}`, ""))
+	b.WriteString(oaiChunk(`{"reasoning":"before answering"}`, ""))
+	b.WriteString(oaiChunk(`{"content":"done"}`, ""))
+	b.WriteString(oaiChunk(`{}`, "stop"))
+	b.WriteString("data: [DONE]\n\n")
+	out, _, err := translateStream(t, strings.NewReader(b.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pings := 0
+	for _, ev := range parseAnthSSE(t, out) {
+		if ev.name == "ping" {
+			pings++
+		}
+	}
+	if pings != 1 || strings.Contains(string(out), "consider ") {
+		t.Fatalf("pings %d, reasoning leaked: %t in %s", pings, strings.Contains(string(out), "consider "), out)
+	}
+	if res := checkAnthStream(t, out); len(res.blocks) != 1 || res.blocks[0]["text"] != "done" || res.stopReason != "end_turn" {
+		t.Fatalf("blocks %v stop %q", res.blocks, res.stopReason)
 	}
 }
 
