@@ -486,7 +486,7 @@ func TestGatewayOpenAIReplaysThinkingPerModel(t *testing.T) {
 
 func TestFromChatCompletion(t *testing.T) {
 	var st oaiStats
-	out, err := fromChatCompletion([]byte(`{"id":"c9","model":"mimir-slim","choices":[{"finish_reason":"tool_calls","message":{"content":"ok","reasoning":"secret","tool_calls":[{"id":"x1","type":"function","function":{"name":"f","arguments":"{\"a\":1}"}},{"id":"x2","type":"function","function":{"name":"g","arguments":"not json"}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":4}}`), &st)
+	out, err := fromChatCompletion([]byte(`{"id":"c9","model":"mimir-slim","choices":[{"finish_reason":"tool_calls","message":{"content":"ok","reasoning":"secret","tool_calls":[{"id":"x1","type":"function","function":{"name":"f","arguments":"{\"a\":1}"}},{"id":"","type":"function","function":{"name":"g","arguments":"not json"}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":4}}`), &st)
 	u := st.Usage
 	if err != nil {
 		t.Fatal(err)
@@ -499,6 +499,9 @@ func TestFromChatCompletion(t *testing.T) {
 	}
 	if fmt.Sprint(c[1].(map[string]any)["input"]) != "map[a:1]" || fmt.Sprint(c[2].(map[string]any)["input"]) != "map[]" {
 		t.Errorf("inputs %v %v", c[1], c[2])
+	}
+	if id := c[2].(map[string]any)["id"]; id != "toolu_c9_1" || fmt.Sprint(st.ThoughtIDs) != "[x1 toolu_c9_1]" { // as the stream path names it
+		t.Errorf("empty id became %v, cached under %v", id, st.ThoughtIDs)
 	}
 }
 

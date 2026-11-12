@@ -381,6 +381,11 @@ func fromChatCompletion(body []byte, st *oaiStats) ([]byte, error) {
 		return nil, errors.New("reply has no choices")
 	}
 	c := r.Choices[0]
+	for i, tc := range c.Message.ToolCalls {
+		if tc.ID == "" { // the same id the stream path invents
+			c.Message.ToolCalls[i].ID = fmt.Sprintf("toolu_%s_%d", r.ID, i)
+		}
+	}
 	st.Usage, st.HaveUsage = r.Usage, true
 	if c.FinishReason != "length" {
 		for _, tc := range c.Message.ToolCalls {
