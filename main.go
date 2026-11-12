@@ -41,7 +41,7 @@ func parseConfig(args []string, getenv func(string) string) (config, error) {
 	}
 	fs.StringVar(&cfg.mimirAPI, "mimir-api", api, "which Mimir API to talk to: anthropic (/anthropic, passthrough) or openai (/v1, translated) (default $MIMIR_API or anthropic)")
 	fs.StringVar(&cfg.mimirURL, "mimir-url", "", "Mimir endpoint for the chosen API (default $MIMIR_ANTHROPIC_URL or $MIMIR_OPENAI_URL)")
-	fs.Var(&efforts, "mimir-effort", "model=effort, the reasoning effort sent to Mimir (repeatable; 'none' alone sends nothing; default cubbit/mimir-pro=high on anthropic, cubbit/mimir-pro=medium on openai)")
+	fs.Var(&efforts, "mimir-effort", "model=effort, the reasoning effort sent to Mimir (repeatable; 'none' alone sends nothing; default cubbit/mimir-pro=high on anthropic; on openai cubbit/mimir=medium, cubbit/mimir-pro=high, cubbit/mimir-slim=high)")
 	maxText := 24 << 10
 	if v := getenv("IT_MAX_REPLY_TEXT"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -76,7 +76,13 @@ func parseConfig(args []string, getenv func(string) string) (config, error) {
 	switch cfg.mimirAPI {
 	case "anthropic":
 	case "openai":
-		valid, urlVar, cfg.effort = openaiEfforts, "MIMIR_OPENAI_URL", map[string]string{"cubbit/mimir-pro": "medium"}
+		// Explicit levels each model accepts: GLM (mimir-pro) takes only low and high and turns anything else into max;
+		// DeepSeek (mimir-slim) rejects medium.
+		valid, urlVar = openaiEfforts, "MIMIR_OPENAI_URL"
+		cfg.effort = map[string]string{"cubbit/mimir": "medium", "cubbit/mimir-pro": "high", "cubbit/mimir-slim": "high"}
+		// Earlier reasoning is replayed to Qwen (mimir) and GLM (mimir-pro), which keep it with these kwargs; not to
+		// DeepSeek (mimir-slim), which loops less without it.
+		cfg.replay = map[string]map[string]any{"cubbit/mimir": {"preserve_thinking": true}, "cubbit/mimir-pro": {"clear_thinking": false}}
 	default:
 		return cfg, fmt.Errorf("--mimir-api %q: want anthropic or openai", cfg.mimirAPI)
 	}

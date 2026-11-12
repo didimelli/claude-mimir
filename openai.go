@@ -29,6 +29,9 @@ type oaiInfo struct {
 	foldStats
 	Effort        string
 	DroppedBlocks int // content blocks with no Chat Completions equivalent (thinking, documents, server tools, ...)
+	Replayed      int // thinking blocks sent back as reasoning_content
+	Injected      int // assistant turns given reasoning from the gateway's cache
+	Missed        int // assistant turns with tool calls the cache had no reasoning for
 	DroppedTools  int // server tools without an input schema
 }
 
@@ -37,6 +40,9 @@ type oaiMessage struct {
 	Content    any           `json:"content"`
 	ToolCalls  []oaiToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string        `json:"tool_call_id,omitempty"`
+	// ReasoningContent is the turn's earlier reasoning, for chat templates that keep it (Qwen preserve_thinking,
+	// GLM clear_thinking=false).
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 type oaiToolCall struct {
@@ -51,6 +57,7 @@ type oaiToolCall struct {
 type anthBlock struct {
 	Type      string          `json:"type"`
 	Text      string          `json:"text"`
+	Thinking  string          `json:"thinking"`
 	ID        string          `json:"id"`
 	Name      string          `json:"name"`
 	Input     json.RawMessage `json:"input"`
@@ -129,7 +136,10 @@ func toolResultText(b anthBlock) (string, []map[string]any) {
 
 // toChatCompletions translates an Anthropic Messages request into a Chat Completions request. Mid-conversation
 // system entries are folded first, exactly as on the /anthropic path (mimir-slim rejects them on /v1 too).
-func toChatCompletions(body []byte, effort string) ([]byte, oaiInfo, error) {
+// A non-nil replay sends earlier assistant thinking back as reasoning_content and merges replay into
+// chat_template_kwargs; nil drops thinking, as before. A turn without thinking whose tool_use ids are in cache gets
+// the reasoning the gateway kept for them.
+func toChatCompletions(body []byte, effort string, replay map[string]any, cache *reasonCache) ([]byte, oaiInfo, error) {
 	var info oaiInfo
 	var req struct {
 		Model      string            `json:"model"`
@@ -146,6 +156,7 @@ func toChatCompletions(body []byte, effort string) ([]byte, oaiInfo, error) {
 		Temperature   json.RawMessage `json:"temperature"`
 		TopP          json.RawMessage `json:"top_p"`
 		StopSequences []string        `json:"stop_sequences"`
+		Kwargs        map[string]any  `json:"chat_template_kwargs"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil, info, err
@@ -168,11 +179,18 @@ func toChatCompletions(body []byte, effort string) ([]byte, oaiInfo, error) {
 		switch roleOf(m) {
 		case "assistant":
 			am := oaiMessage{Role: "assistant"}
-			var texts []string
+			var texts, thoughts []string
 			for _, b := range blocks {
 				switch b.Type {
 				case "text":
 					texts = append(texts, b.Text)
+				case "thinking":
+					if replay == nil {
+						info.DroppedBlocks++
+						continue
+					}
+					thoughts = append(thoughts, b.Thinking)
+					info.Replayed++
 				case "tool_use":
 					tc := oaiToolCall{ID: b.ID, Type: "function"}
 					tc.Function.Name = b.Name
@@ -181,8 +199,21 @@ func toChatCompletions(body []byte, effort string) ([]byte, oaiInfo, error) {
 						tc.Function.Arguments = string(b.Input)
 					}
 					am.ToolCalls = append(am.ToolCalls, tc)
-				default: // thinking, redacted_thinking, server tool blocks
+				default: // redacted_thinking, server tool blocks
 					info.DroppedBlocks++
+				}
+			}
+			am.ReasoningContent = strings.Join(thoughts, "\n")
+			if replay != nil && len(thoughts) == 0 {
+				for _, tc := range am.ToolCalls {
+					if r, ok := cache.get(req.Model, tc.ID); ok {
+						am.ReasoningContent = r
+						info.Injected++
+						break
+					}
+				}
+				if am.ReasoningContent == "" && len(am.ToolCalls) > 0 {
+					info.Missed++
 				}
 			}
 			am.Content = strings.Join(texts, "\n\n")
@@ -272,6 +303,17 @@ func toChatCompletions(body []byte, effort string) ([]byte, oaiInfo, error) {
 		creq["reasoning_effort"] = effort
 		info.Effort = effort
 	}
+	if replay != nil { // without replay the client's kwargs are not forwarded, as before
+		if req.Kwargs == nil {
+			req.Kwargs = map[string]any{}
+		}
+		for k, v := range replay {
+			if _, set := req.Kwargs[k]; !set { // the client's own value wins
+				req.Kwargs[k] = v
+			}
+		}
+		creq["chat_template_kwargs"] = req.Kwargs
+	}
 	return marshal(creq), info, nil
 }
 
@@ -319,27 +361,44 @@ func toolInput(args string) json.RawMessage {
 	return json.RawMessage(args)
 }
 
-// fromChatCompletion translates a non-streamed Chat Completions reply into an Anthropic message.
-func fromChatCompletion(body []byte) ([]byte, oaiUsage, error) {
+// fromChatCompletion translates a non-streamed Chat Completions reply into an Anthropic message. It records the usage
+// in st, and the reasoning of a reply that called tools (for the reasoning cache).
+func fromChatCompletion(body []byte, st *oaiStats) ([]byte, error) {
 	var r struct {
 		ID      string `json:"id"`
 		Model   string `json:"model"`
 		Choices []struct {
 			FinishReason string `json:"finish_reason"`
 			Message      struct {
-				Content   *string       `json:"content"`
-				ToolCalls []oaiToolCall `json:"tool_calls"`
+				Content          *string       `json:"content"`
+				Reasoning        *string       `json:"reasoning"`
+				ReasoningContent *string       `json:"reasoning_content"`
+				ToolCalls        []oaiToolCall `json:"tool_calls"`
 			} `json:"message"`
 		} `json:"choices"`
 		Usage oaiUsage `json:"usage"`
 	}
 	if err := json.Unmarshal(body, &r); err != nil {
-		return nil, r.Usage, err
+		return nil, err
 	}
 	if len(r.Choices) == 0 {
-		return nil, r.Usage, errors.New("reply has no choices")
+		return nil, errors.New("reply has no choices")
 	}
 	c := r.Choices[0]
+	for i, tc := range c.Message.ToolCalls {
+		if tc.ID == "" { // the same id the stream path invents
+			c.Message.ToolCalls[i].ID = fmt.Sprintf("toolu_%s_%d", r.ID, i)
+		}
+	}
+	st.Usage, st.HaveUsage = r.Usage, true
+	if c.FinishReason != "length" {
+		for _, tc := range c.Message.ToolCalls {
+			st.ThoughtIDs = append(st.ThoughtIDs, tc.ID)
+		}
+		if len(st.ThoughtIDs) > 0 {
+			st.Thought = firstNonEmpty(c.Message.Reasoning, c.Message.ReasoningContent)
+		}
+	}
 	content := []any{}
 	if c.Message.Content != nil && *c.Message.Content != "" {
 		content = append(content, map[string]string{"type": "text", "text": *c.Message.Content})
@@ -352,7 +411,7 @@ func fromChatCompletion(body []byte) ([]byte, oaiUsage, error) {
 		"stop_reason": stopReason(c.FinishReason, len(c.Message.ToolCalls) > 0), "stop_sequence": nil,
 		"usage": map[string]int{"input_tokens": r.Usage.PromptTokens, "output_tokens": r.Usage.CompletionTokens},
 	}
-	return marshal(msg), r.Usage, nil
+	return marshal(msg), nil
 }
 
 // oaiStats is what the stream translator reports to the log line.
@@ -366,7 +425,10 @@ type oaiStats struct {
 	ToolCalls       int
 	LateFragments   int // argument fragments for a tool call already closed (dropped)
 	Truncated       bool
-	StreamError     string // an error Mimir sent inside the stream
+	StreamError     string   // an error Mimir sent inside the stream
+	Thought         string   // the reasoning of a complete reply that called tools
+	ThoughtIDs      []string // the ids of those tool calls
+	Cached          bool     // Thought went into the reasoning cache
 }
 
 func firstNonEmpty(a, b *string) string {
@@ -424,6 +486,10 @@ type chatStream struct {
 	closed   map[int]bool
 	finish   string
 	sawTool  bool
+
+	onEnd   func()          // non-nil: collect reasoning and tool call ids, set stats.Thought, then call it at the end
+	thought strings.Builder // collected reasoning, up to reasonMaxBytes+1
+	ids     []string
 }
 
 func newChatStream(rc io.ReadCloser, stats *oaiStats) *chatStream {
@@ -504,6 +570,9 @@ func (s *chatStream) handle(data []byte) {
 		if r := firstNonEmpty(d.Reasoning, d.ReasoningContent); r != "" {
 			s.stats.ReasoningChunks++ // never shown: Mimir's reasoning has no signature Claude Code could replay
 			s.stats.Reasoning.feed(r)
+			if s.onEnd != nil && s.thought.Len() <= reasonMaxBytes {
+				s.thought.WriteString(r)
+			}
 		}
 		if d.Content != nil && *d.Content != "" {
 			s.stats.Text.feed(*d.Content)
@@ -528,6 +597,7 @@ func (s *chatStream) handle(data []byte) {
 				}
 				s.openBlock("tool", map[string]any{"type": "tool_use", "id": id, "name": name, "input": map[string]any{}})
 				s.openTool = tc.Index
+				s.ids = append(s.ids, id)
 				s.sawTool = true
 				s.stats.ToolCalls++
 			}
@@ -550,6 +620,11 @@ func (s *chatStream) end() {
 	s.stats.Reasoning.flush()
 	if !s.started {
 		return
+	}
+	// before message_stop goes out, so the client's next request finds it
+	if s.onEnd != nil && !s.stats.Truncated && s.finish != "length" && len(s.ids) > 0 && s.thought.Len() <= reasonMaxBytes {
+		s.stats.Thought, s.stats.ThoughtIDs = s.thought.String(), s.ids
+		s.onEnd()
 	}
 	s.closeBlock()
 	stop := stopReason(s.finish, s.sawTool)

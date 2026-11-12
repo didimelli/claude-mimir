@@ -22,9 +22,10 @@ type config struct {
 	mimirAPI                                     string // "anthropic" (mimirURL is Mimir's /anthropic) or "openai" (mimirURL is its /v1)
 	port                                         int
 	prefix                                       []string
-	effort                                       map[string]string // request model -> reasoning effort sent to Mimir
-	runaway                                      string            // "log" (default) or "off": measure runaway replies in the request log
-	maxReplyText                                 int               // visible reply bytes from which a reply counts as a runaway
+	effort                                       map[string]string         // request model -> reasoning effort sent to Mimir
+	replay                                       map[string]map[string]any // openai: model -> chat_template_kwargs; listed models get earlier thinking replayed
+	runaway                                      string                    // "log" (default) or "off": measure runaway replies in the request log
+	maxReplyText                                 int                       // visible reply bytes from which a reply counts as a runaway
 }
 
 type gateway struct {
@@ -35,6 +36,7 @@ type gateway struct {
 	mimir     *httputil.ReverseProxy
 	anthURL   *url.URL
 	mimirU    *url.URL
+	reasoning *reasonCache
 }
 
 type ctxKey struct{}
@@ -53,6 +55,8 @@ type reqInfo struct {
 	sent   int64
 	fix    *fixStats
 	oai    *oaiStats
+	replay bool   // the model gets its earlier reasoning back: keep this reply's
+	model  string // the request model, which keys the reasoning cache
 	once   sync.Once
 }
 
@@ -85,6 +89,9 @@ func (ri *reqInfo) finish() {
 				ri.rec["input_tokens"], ri.rec["output_tokens"] = s.Usage.PromptTokens, s.Usage.CompletionTokens
 			}
 			ri.rec["reasoning_chunks"], ri.rec["tool_calls"] = s.ReasoningChunks, s.ToolCalls
+			if s.Cached {
+				ri.rec["reasoning_cached"] = 1
+			}
 			if s.Measured && ri.g.cfg.runaway != "off" {
 				ri.rec["text_chars"], ri.rec["reasoning_chars"] = s.Text.Chars, s.Reasoning.Chars
 				ri.rec["text_max_repeat"], ri.rec["reasoning_max_repeat"] = s.Text.MaxRepeat, s.Reasoning.MaxRepeat
@@ -98,6 +105,9 @@ func (ri *reqInfo) finish() {
 			if s.StreamError != "" && ri.errMsg == "" {
 				ri.rec["error"] = "mimir stream error: " + s.StreamError
 			}
+		}
+		if ri.g.cfg.mimirAPI == "openai" {
+			ri.rec["reasoning_cache"] = ri.g.reasoning.len() // entries after this request
 		}
 		ri.rec["ms"] = time.Since(ri.start).Milliseconds()
 		ri.g.log.write(ri.rec)
@@ -163,7 +173,8 @@ func newTransport() *http.Transport {
 }
 
 func newGateway(cfg config) (*gateway, error) {
-	g := &gateway{cfg: cfg, transport: newTransport(), log: &reqLogger{path: cfg.logPath}}
+	g := &gateway{cfg: cfg, transport: newTransport(), log: &reqLogger{path: cfg.logPath},
+		reasoning: newReasonCache(reasonBudget, reasonMaxBytes, reasonTTL)}
 	var err error
 	if g.anthURL, err = url.Parse(cfg.anthropic); err != nil {
 		return nil, err
@@ -255,19 +266,24 @@ func (g *gateway) modifyResponse(resp *http.Response) error {
 	}
 	if openai {
 		ri.oai = &oaiStats{}
+		keep := func() { ri.oai.Cached = g.reasoning.put(ri.model, ri.oai.ThoughtIDs, ri.oai.Thought) }
 		if isEventStream(resp.Header.Get("Content-Type")) {
-			resp.Body = newChatStream(resp.Body, ri.oai)
+			cs := newChatStream(resp.Body, ri.oai)
+			if ri.replay {
+				cs.onEnd = keep
+			}
+			resp.Body = cs
 			resp.Header = http.Header{"Content-Type": {"text/event-stream"}, "Cache-Control": {"no-cache"}}
 		} else {
 			payload, err := io.ReadAll(io.LimitReader(resp.Body, 256<<20))
 			_ = resp.Body.Close()
-			nb, usage, terr := fromChatCompletion(payload)
+			nb, terr := fromChatCompletion(payload, ri.oai)
 			if err != nil || terr != nil {
 				st, eb := translateOpenAIError(502, []byte(fmt.Sprintf(`{"error":{"message":"could not translate Mimir's reply: %v %v"}}`, err, terr)))
 				resp.StatusCode, resp.Status, ri.status, nb = st, fmt.Sprintf("%d %s", st, http.StatusText(st)), st, eb
 				ri.errMsg = "untranslatable reply"
-			} else {
-				ri.oai.Usage, ri.oai.HaveUsage = usage, true
+			} else if ri.replay {
+				keep()
 			}
 			resp.Header = http.Header{"Content-Type": {"application/json"}}
 			resp.Body = io.NopCloser(bytes.NewReader(nb))
@@ -357,7 +373,7 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if mimir {
 		route, proxy, upstream = "mimir", g.mimir, g.mimirU
 	}
-	ri := &reqInfo{g: g, route: route, start: time.Now(), logIt: shape != nil}
+	ri := &reqInfo{g: g, route: route, model: model, start: time.Now(), logIt: shape != nil}
 	ri.rec = map[string]any{
 		"ts": ri.start.Format("2006-01-02T15:04:05"), "ts_utc": ri.start.UTC().Format(time.RFC3339), "route": route, "method": r.Method, "path": path, "model": nilIfEmpty(model),
 		"req_bytes": len(body), "session": nilIfEmpty(r.Header.Get("X-Claude-Code-Session-Id")),
@@ -376,7 +392,8 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if g.cfg.mimirAPI == "openai" {
 			ri.rec["mimir_api"] = "openai"
-			translated, info, err := toChatCompletions(src, g.cfg.effort[model])
+			ri.replay = g.cfg.replay[model] != nil
+			translated, info, err := toChatCompletions(src, g.cfg.effort[model], g.cfg.replay[model], g.reasoning)
 			if err != nil {
 				ri.status = http.StatusBadRequest
 				ri.errMsg = "untranslatable request: " + err.Error()
@@ -389,6 +406,15 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				ri.rec["effort"] = info.Effort
 			}
 			ri.rec["folded"], ri.rec["dropped_blocks"], ri.rec["hoisted"] = info.Folded, info.foldStats.DroppedBlocks+info.DroppedBlocks, info.Hoisted
+			if info.Replayed > 0 {
+				ri.rec["replayed_thinking"] = info.Replayed
+			}
+			if info.Injected > 0 {
+				ri.rec["reasoning_injected"] = info.Injected
+			}
+			if info.Missed > 0 {
+				ri.rec["reasoning_missed"] = info.Missed
+			}
 			if info.DroppedTools > 0 {
 				ri.rec["dropped_tools"] = info.DroppedTools
 			}
