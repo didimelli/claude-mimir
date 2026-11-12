@@ -205,7 +205,7 @@ func toChatCompletions(body []byte, effort string, replay map[string]any, cache 
 			am.ReasoningContent = strings.Join(thoughts, "\n")
 			if replay != nil && len(thoughts) == 0 {
 				for _, tc := range am.ToolCalls {
-					if r, ok := cache.get(tc.ID); ok {
+					if r, ok := cache.get(req.Model, tc.ID); ok {
 						am.ReasoningContent = r
 						info.Injected++
 						break

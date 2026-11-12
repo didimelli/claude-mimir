@@ -55,7 +55,8 @@ type reqInfo struct {
 	sent   int64
 	fix    *fixStats
 	oai    *oaiStats
-	replay bool // the model gets its earlier reasoning back: keep this reply's
+	replay bool   // the model gets its earlier reasoning back: keep this reply's
+	model  string // the request model, which keys the reasoning cache
 	once   sync.Once
 }
 
@@ -170,7 +171,7 @@ func newTransport() *http.Transport {
 
 func newGateway(cfg config) (*gateway, error) {
 	g := &gateway{cfg: cfg, transport: newTransport(), log: &reqLogger{path: cfg.logPath},
-		reasoning: newReasonCache(reasonMaxEntries, reasonMaxBytes, reasonTTL)}
+		reasoning: newReasonCache(reasonBudget, reasonMaxBytes, reasonTTL)}
 	var err error
 	if g.anthURL, err = url.Parse(cfg.anthropic); err != nil {
 		return nil, err
@@ -262,7 +263,7 @@ func (g *gateway) modifyResponse(resp *http.Response) error {
 	}
 	if openai {
 		ri.oai = &oaiStats{}
-		keep := func() { ri.oai.Cached = g.reasoning.put(ri.oai.ThoughtIDs, ri.oai.Thought) }
+		keep := func() { ri.oai.Cached = g.reasoning.put(ri.model, ri.oai.ThoughtIDs, ri.oai.Thought) }
 		if isEventStream(resp.Header.Get("Content-Type")) {
 			cs := newChatStream(resp.Body, ri.oai)
 			if ri.replay {
@@ -369,7 +370,7 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if mimir {
 		route, proxy, upstream = "mimir", g.mimir, g.mimirU
 	}
-	ri := &reqInfo{g: g, route: route, start: time.Now(), logIt: shape != nil}
+	ri := &reqInfo{g: g, route: route, model: model, start: time.Now(), logIt: shape != nil}
 	ri.rec = map[string]any{
 		"ts": ri.start.Format("2006-01-02T15:04:05"), "ts_utc": ri.start.UTC().Format(time.RFC3339), "route": route, "method": r.Method, "path": path, "model": nilIfEmpty(model),
 		"req_bytes": len(body), "session": nilIfEmpty(r.Header.Get("X-Claude-Code-Session-Id")),
