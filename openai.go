@@ -299,15 +299,15 @@ func toChatCompletions(body []byte, effort string, replay map[string]any, cache 
 		creq["reasoning_effort"] = effort
 		info.Effort = effort
 	}
-	if req.Kwargs == nil && replay != nil {
-		req.Kwargs = map[string]any{}
-	}
-	for k, v := range replay {
-		if _, set := req.Kwargs[k]; !set { // the client's own value wins
-			req.Kwargs[k] = v
+	if replay != nil { // without replay the client's kwargs are not forwarded, as before
+		if req.Kwargs == nil {
+			req.Kwargs = map[string]any{}
 		}
-	}
-	if len(req.Kwargs) > 0 {
+		for k, v := range replay {
+			if _, set := req.Kwargs[k]; !set { // the client's own value wins
+				req.Kwargs[k] = v
+			}
+		}
 		creq["chat_template_kwargs"] = req.Kwargs
 	}
 	return marshal(creq), info, nil

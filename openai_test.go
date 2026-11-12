@@ -440,8 +440,8 @@ func TestToChatCompletionsReplaysThinking(t *testing.T) {
 		t.Errorf("kwargs %v", m["chat_template_kwargs"])
 	}
 
-	// mimir-slim: no replay, thinking dropped as before.
-	m, info = chatReq(t, thinkingTurn+`}`, "high")
+	// mimir-slim: no replay, thinking and the client's kwargs dropped as before.
+	m, info = chatReq(t, thinkingTurn+`,"chat_template_kwargs":{"enable_thinking":true}}`, "high")
 	a = m["messages"].([]any)[1].(map[string]any)
 	if _, ok := a["reasoning_content"]; ok || info.Replayed != 0 || info.DroppedBlocks != 3 {
 		t.Errorf("slim assistant %v replayed %d dropped %d", a, info.Replayed, info.DroppedBlocks)
