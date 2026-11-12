@@ -106,6 +106,9 @@ func (ri *reqInfo) finish() {
 				ri.rec["error"] = "mimir stream error: " + s.StreamError
 			}
 		}
+		if ri.g.cfg.mimirAPI == "openai" {
+			ri.rec["reasoning_cache"] = ri.g.reasoning.len() // entries after this request
+		}
 		ri.rec["ms"] = time.Since(ri.start).Milliseconds()
 		ri.g.log.write(ri.rec)
 	})
@@ -408,6 +411,9 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			if info.Injected > 0 {
 				ri.rec["reasoning_injected"] = info.Injected
+			}
+			if info.Missed > 0 {
+				ri.rec["reasoning_missed"] = info.Missed
 			}
 			if info.DroppedTools > 0 {
 				ri.rec["dropped_tools"] = info.DroppedTools

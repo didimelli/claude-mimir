@@ -129,7 +129,8 @@ func TestGatewayCachesReasoningAcrossTurns(t *testing.T) {
 			t.Errorf("stream=%v: other model's reasoning injected %v", stream, a)
 		}
 		lg := r.logs(t)
-		if lg[0]["reasoning_cached"] != 1.0 || lg[1]["reasoning_injected"] != 1.0 || lg[2]["reasoning_injected"] != nil || lg[3]["reasoning_injected"] != nil {
+		if lg[0]["reasoning_cached"] != 1.0 || lg[1]["reasoning_injected"] != 1.0 || lg[2]["reasoning_injected"] != nil || lg[3]["reasoning_injected"] != nil ||
+			lg[1]["reasoning_missed"] != nil || lg[2]["reasoning_missed"] != 1.0 || lg[3]["reasoning_missed"] != 1.0 || lg[0]["reasoning_cache"] != 1.0 {
 			t.Errorf("stream=%v: log %v", stream, lg)
 		}
 	}

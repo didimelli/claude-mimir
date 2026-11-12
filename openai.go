@@ -31,6 +31,7 @@ type oaiInfo struct {
 	DroppedBlocks int // content blocks with no Chat Completions equivalent (thinking, documents, server tools, ...)
 	Replayed      int // thinking blocks sent back as reasoning_content
 	Injected      int // assistant turns given reasoning from the gateway's cache
+	Missed        int // assistant turns with tool calls the cache had no reasoning for
 	DroppedTools  int // server tools without an input schema
 }
 
@@ -210,6 +211,9 @@ func toChatCompletions(body []byte, effort string, replay map[string]any, cache 
 						info.Injected++
 						break
 					}
+				}
+				if am.ReasoningContent == "" && len(am.ToolCalls) > 0 {
+					info.Missed++
 				}
 			}
 			am.Content = strings.Join(texts, "\n\n")
