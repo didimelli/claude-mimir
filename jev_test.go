@@ -101,10 +101,10 @@ func TestParseSystemOne(t *testing.T) {
 		t.Fatalf("%v %v %v %v", pYes, pNo, confidence, err)
 	}
 	for name, body := range map[string]string{
-		"missing answers.q": `{}`,
+		"missing answers.q":       `{}`,
 		"confidence out of range": `{"answers":{"q":{"probabilities":{"yes":0.9,"no":0.1},"confidence":1.5}}}`,
-		"empty q object":        `{"answers":{"q":{}}}`,
-		"noul only":              `{"answers":{"q":{"noul":0.9}}}`,
+		"empty q object":          `{"answers":{"q":{}}}`,
+		"noul only":               `{"answers":{"q":{"noul":0.9}}}`,
 	} {
 		if _, _, _, err := parseSystemOne([]byte(body)); err == nil {
 			t.Errorf("%s: accepted %s", name, body)

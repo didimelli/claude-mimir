@@ -160,8 +160,8 @@ func jevReply(model string, pYes, pNo, confidence float64, stream bool) []byte {
 	}
 	return marshal(map[string]any{
 		"id": "msg_jev", "type": "message", "role": "assistant", "model": model,
-		"content":          []any{map[string]any{"type": "text", "text": string(line)}},
-		"stop_reason":      "end_turn", "stop_sequence": nil, "usage": usage,
+		"content":     []any{map[string]any{"type": "text", "text": string(line)}},
+		"stop_reason": "end_turn", "stop_sequence": nil, "usage": usage,
 	})
 }
 
