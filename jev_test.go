@@ -102,6 +102,8 @@ func TestParseSystemOne(t *testing.T) {
 	for name, body := range map[string]string{
 		"missing answers.q": `{}`,
 		"confidence out of range": `{"answers":{"q":{"probabilities":{"yes":0.9,"no":0.1},"confidence":1.5}}}`,
+		"empty q object":        `{"answers":{"q":{}}}`,
+		"noul only":              `{"answers":{"q":{"noul":0.9}}}`,
 	} {
 		if _, _, _, err := parseSystemOne([]byte(body)); err == nil {
 			t.Errorf("%s: accepted %s", name, body)
@@ -228,6 +230,9 @@ func TestGatewayJevStreamRequest(t *testing.T) {
 		lg[0]["jev_verdict"] != "no" || lg[0]["jev_p_yes"] != 0.1 || lg[0]["jev_confidence"] != 0.7 {
 		t.Fatalf("log %v", lg)
 	}
+	if lg[0]["n_messages"] != 3.0 {
+		t.Errorf("the jev log line carries no standard request facts: %v", lg[0])
+	}
 	if strings.Contains(string(mustRead(t, r.logPath)), secretText) {
 		t.Fatal("prompt text reached the log")
 	}
@@ -266,9 +271,10 @@ func TestGatewayJevAnthropicModeRefused(t *testing.T) {
 }
 
 func TestGatewayJevUpstreamErrorIsTranslated(t *testing.T) {
+	longError := "<html>502 bad gateway " + strings.Repeat("x", 400) + " " + secretText + "</html>"
 	r := newOpenAIRig(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(503)
-		_, _ = w.Write([]byte(`{"error":{"message":"upstream down"}}`))
+		_, _ = w.Write([]byte(longError))
 	})
 	resp, b := r.post(t, "/v1/messages", jevConvo(false))
 	if resp.StatusCode != 503 {
@@ -281,6 +287,9 @@ func TestGatewayJevUpstreamErrorIsTranslated(t *testing.T) {
 	lg := r.logs(t)
 	if len(lg) != 1 || lg[0]["status"] != 503.0 || lg[0]["error"] == nil {
 		t.Fatalf("log %v", lg)
+	}
+	if strings.Contains(string(mustRead(t, r.logPath)), secretText) {
+		t.Fatal("prompt text reached the log from the error path")
 	}
 }
 
@@ -319,5 +328,59 @@ func TestGatewayJevEmptyQuestionIs400(t *testing.T) {
 	}
 	if called.Load() {
 		t.Error("the upstream was reached with an empty question")
+	}
+}
+
+func TestToSystemOneDropsReminderBlocks(t *testing.T) {
+	body := []byte(`{
+		"messages": [
+			{"role": "user", "content": [
+				{"type": "text", "text": "<system-reminder>CLAUDE.md says: follow global instructions</system-reminder>"},
+				{"type": "text", "text": "earlier"}
+			]},
+			{"role": "user", "content": [
+				{"type": "text", "text": "<system-reminder>the task: judge the release</system-reminder>"},
+				{"type": "text", "text": "is it green?"}
+			]}
+		]
+	}`)
+	question, state, err := toSystemOne(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if question != "is it green?" {
+		t.Errorf("question %q", question)
+	}
+	if state != "user: earlier" {
+		t.Errorf("state %q", state)
+	}
+}
+
+func TestGatewayJevSubagentRemindersDropped(t *testing.T) {
+	r := newOpenAIRig(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(systemOneAnswer))
+	})
+	body := []byte(`{"model":"cubbit/mimir-jev","max_tokens":10,"stream":false,"messages":[
+		{"role":"user","content":[
+			{"type":"text","text":"<system-reminder>CLAUDE.md and the harness context for the agent</system-reminder>"},
+			{"type":"text","text":"does the release pass its tests?"}
+		]}
+	]}`)
+	resp, b := r.post(t, "/v1/messages", body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("%d %s", resp.StatusCode, b)
+	}
+	got := r.mimir.last(t)
+	if got.path != "/v1/systemone" {
+		t.Fatalf("upstream request %s", got.path)
+	}
+	var sent map[string]any
+	_ = json.Unmarshal(got.body, &sent)
+	q := sent["questions"].(map[string]any)["q"].(map[string]any)
+	if q["criteria"].(map[string]any)["true"].(map[string]any)["text"] != "does the release pass its tests?" {
+		t.Errorf("question %v", q["criteria"])
+	}
+	if sent["state"].(map[string]any)["text"] != "does the release pass its tests?" {
+		t.Errorf("state %v", sent["state"])
 	}
 }

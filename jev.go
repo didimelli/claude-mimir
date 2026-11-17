@@ -17,6 +17,14 @@ import (
 
 const jevModel = "cubbit/mimir-jev"
 
+// isReminder reports a text that is entirely a Claude Code system-reminder wrapper. The harness injects them
+// into user turns (CLAUDE.md, hooks output, attached context); judging them as the question or as evidence would
+// dilute the calibration the way the system prompt does, which toSystemOne already excludes.
+func isReminder(s string) bool {
+	t := strings.TrimSpace(s)
+	return strings.HasPrefix(t, reminderOpen) && strings.HasSuffix(t, "</system-reminder>")
+}
+
 // toSystemOne pulls the (question, state) pair out of a Messages request. The system prompt is never
 // judged on: it is Claude Code boilerplate, and jev's calibration dilutes fast.
 func toSystemOne(body []byte) (question, state string, err error) {
@@ -44,7 +52,7 @@ func toSystemOne(body []byte) (question, state string, err error) {
 	}
 	var qs []string
 	for _, b := range blocksOfContent(msgs[last]["content"]) {
-		if b.Type == "text" && b.Text != "" {
+		if b.Type == "text" && b.Text != "" && !isReminder(b.Text) {
 			qs = append(qs, b.Text)
 		}
 	}
@@ -55,7 +63,7 @@ func toSystemOne(body []byte) (question, state string, err error) {
 		for _, b := range blocksOfContent(m["content"]) {
 			switch b.Type {
 			case "text":
-				if b.Text != "" {
+				if b.Text != "" && !isReminder(b.Text) {
 					ts = append(ts, b.Text)
 				}
 			case "tool_result":
@@ -87,21 +95,21 @@ func parseSystemOne(body []byte) (pYes, pNo, confidence float64, err error) {
 		Answers struct {
 			Q *struct {
 				Probabilities struct {
-					Yes float64 `json:"yes"`
-					No  float64 `json:"no"`
+					Yes *float64 `json:"yes"`
+					No  *float64 `json:"no"`
 				} `json:"probabilities"`
-				Confidence float64 `json:"confidence"`
+				Confidence *float64 `json:"confidence"`
 			} `json:"q"`
 		} `json:"answers"`
 	}
 	if err := json.Unmarshal(body, &r); err != nil {
 		return 0, 0, 0, err
 	}
-	if r.Answers.Q == nil {
+	a := r.Answers.Q
+	if a == nil || a.Probabilities.Yes == nil || a.Probabilities.No == nil || a.Confidence == nil {
 		return 0, 0, 0, errors.New("no answers.q in the SystemOne reply")
 	}
-	a := r.Answers.Q
-	if pYes, pNo, confidence = a.Probabilities.Yes, a.Probabilities.No, a.Confidence; pYes < 0 || pYes > 1 || pNo < 0 || pNo > 1 || confidence < 0 || confidence > 1 {
+	if pYes, pNo, confidence = *a.Probabilities.Yes, *a.Probabilities.No, *a.Confidence; pYes < 0 || pYes > 1 || pNo < 0 || pNo > 1 || confidence < 0 || confidence > 1 {
 		return 0, 0, 0, errors.New("SystemOne probabilities or confidence outside [0, 1]")
 	}
 	return pYes, pNo, confidence, nil
@@ -232,7 +240,7 @@ func (g *gateway) serveJev(w http.ResponseWriter, r *http.Request, ri *reqInfo, 
 // the client, and only the translated status plus the upstream's message are logged.
 func (g *gateway) jevFailStatus(w http.ResponseWriter, ri *reqInfo, status int, payload []byte) {
 	st, eb := translateOpenAIError(status, payload)
-	ri.status, ri.errMsg = st, errorText(payload)
+	ri.status, ri.errMsg = st, errorMessage(eb, "") // structured and bounded, exactly like the proxied legs
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(st)
 	_, _ = w.Write(eb)
