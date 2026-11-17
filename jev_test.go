@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -162,5 +164,160 @@ func TestJevReplyStreamed(t *testing.T) {
 	probs, _ := line["probabilities"].(map[string]any)
 	if probs["yes"] != 0.3 || probs["no"] != 0.7 || line["confidence"] != 0.9 {
 		t.Errorf("line %v", line)
+	}
+}
+
+// ---- through the gateway -------------------------------------------------------------------------------------
+
+const systemOneAnswer = `{"answers":{"q":{"noul":0.1,"probabilities":{"yes":0.1,"no":0.9},"confidence":0.7}}}`
+
+func jevConvo(stream bool) []byte {
+	s := "false"
+	if stream {
+		s = "true"
+	}
+	return []byte(`{"model":"cubbit/mimir-jev","max_tokens":10,"stream":` + s + `,
+		"system":[{"type":"text","text":"system prompt text"}],
+		"messages":[
+			{"role":"assistant","content":"` + secretText + ` evidence"},
+			{"role":"user","content":"` + secretText + ` evidence too"},
+			{"role":"user","content":"does the earlier turn hold?"}
+		]}`)
+}
+
+func TestGatewayJevStreamRequest(t *testing.T) {
+	r := newOpenAIRig(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(systemOneAnswer))
+	})
+	resp, b := r.post(t, "/v1/messages", jevConvo(true))
+	if resp.StatusCode != 200 || resp.Header.Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("%d %v", resp.StatusCode, resp.Header)
+	}
+	res := checkAnthStream(t, b)
+	if len(res.blocks) != 1 {
+		t.Fatalf("blocks %v", res.blocks)
+	}
+	line := jevText(t, []byte(res.blocks[0]["text"].(string)))
+	if line["verdict"] != "no" {
+		t.Errorf("verdict %v", line)
+	}
+	got := r.mimir.last(t)
+	if got.path != "/v1/systemone" {
+		t.Errorf("upstream request %s", got.path)
+	}
+	if got.header.Get("Authorization") != "Bearer mimir-test-key" {
+		t.Errorf("authorization %v", got.header)
+	}
+	var sent map[string]any
+	_ = json.Unmarshal(got.body, &sent)
+	q := sent["questions"].(map[string]any)["q"].(map[string]any)
+	if q["type"] != "noul" {
+		t.Errorf("question %v", q)
+	}
+	cr := q["criteria"].(map[string]any)
+	if cr["true"].(map[string]any)["text"] != "does the earlier turn hold?" || cr["false"] != nil {
+		t.Errorf("criteria %v", cr)
+	}
+	wantState := "assistant: " + secretText + " evidence\n\nuser: " + secretText + " evidence too"
+	if sent["state"].(map[string]any)["text"] != wantState {
+		t.Errorf("state %v", sent["state"])
+	}
+	lg := r.logs(t)
+	if len(lg) != 1 || lg[0]["model"] != "cubbit/mimir-jev" || lg[0]["status"] != 200.0 ||
+		lg[0]["jev_verdict"] != "no" || lg[0]["jev_p_yes"] != 0.1 || lg[0]["jev_confidence"] != 0.7 {
+		t.Fatalf("log %v", lg)
+	}
+	if strings.Contains(string(mustRead(t, r.logPath)), secretText) {
+		t.Fatal("prompt text reached the log")
+	}
+}
+
+func TestGatewayJevNonStreamRequest(t *testing.T) {
+	r := newOpenAIRig(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(systemOneAnswer))
+	})
+	resp, b := r.post(t, "/v1/messages", jevConvo(false))
+	if resp.StatusCode != 200 || resp.Header.Get("Content-Type") != "application/json" {
+		t.Fatalf("%d %v", resp.StatusCode, resp.Header)
+	}
+	m := jevText(t, b)
+	if m["type"] != "message" || m["stop_reason"] != "end_turn" {
+		t.Fatalf("%s", b)
+	}
+	line := jevText(t, []byte(m["content"].([]any)[0].(map[string]any)["text"].(string)))
+	if line["verdict"] != "no" || line["probabilities"].(map[string]any)["yes"] != 0.1 || line["confidence"] != 0.7 {
+		t.Errorf("line %v", line)
+	}
+}
+
+func TestGatewayJevAnthropicModeRefused(t *testing.T) {
+	var called atomic.Bool
+	r := newOpenAIRigWith(t, func(w http.ResponseWriter, _ *http.Request) {
+		called.Store(true)
+	}, func(c *config) { c.mimirAPI = "anthropic" })
+	resp, b := r.post(t, "/v1/messages", jevConvo(false))
+	if resp.StatusCode != 400 || !strings.Contains(string(b), "mimir-jev") || !strings.Contains(string(b), "openai") {
+		t.Fatalf("%d %s", resp.StatusCode, b)
+	}
+	if called.Load() {
+		t.Error("the upstream was reached in anthropic mode")
+	}
+}
+
+func TestGatewayJevUpstreamErrorIsTranslated(t *testing.T) {
+	r := newOpenAIRig(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(503)
+		_, _ = w.Write([]byte(`{"error":{"message":"upstream down"}}`))
+	})
+	resp, b := r.post(t, "/v1/messages", jevConvo(false))
+	if resp.StatusCode != 503 {
+		t.Fatalf("%d %s", resp.StatusCode, b)
+	}
+	e := jevText(t, b)
+	if e["type"] != "error" || e["error"].(map[string]any)["type"] != "api_error" {
+		t.Fatalf("%s", b)
+	}
+	lg := r.logs(t)
+	if len(lg) != 1 || lg[0]["status"] != 503.0 || lg[0]["error"] == nil {
+		t.Fatalf("log %v", lg)
+	}
+}
+
+func TestGatewayJevBadAnswerIs502(t *testing.T) {
+	r := newOpenAIRig(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	})
+	resp, b := r.post(t, "/v1/messages", jevConvo(false))
+	if got := r.mimir.last(t).path; got != "/v1/systemone" {
+		t.Fatalf("upstream request %s", got)
+	}
+	if resp.StatusCode != 502 || strings.Contains(string(b), "{}") {
+		t.Fatalf("%d %s", resp.StatusCode, b)
+	}
+	if e := jevText(t, b); e["error"].(map[string]any)["type"] != "api_error" {
+		t.Fatalf("%s", b)
+	}
+	lg := r.logs(t)
+	if len(lg) != 1 || lg[0]["error"] == nil {
+		t.Fatalf("log %v", lg)
+	}
+}
+
+func TestGatewayJevEmptyQuestionIs400(t *testing.T) {
+	var called atomic.Bool
+	r := newOpenAIRig(t, func(w http.ResponseWriter, _ *http.Request) {
+		called.Store(true)
+	})
+	body := []byte(`{"model":"cubbit/mimir-jev","max_tokens":10,"messages":[
+		{"role":"user","content":"earlier text"},
+		{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"xx"}}]}
+	]}`)
+	resp, b := r.post(t, "/v1/messages", body)
+	if resp.StatusCode != 400 || !strings.Contains(string(b), "question") {
+		t.Fatalf("%d %s", resp.StatusCode, b)
+	}
+	if called.Load() {
+		t.Error("the upstream was reached with an empty question")
 	}
 }

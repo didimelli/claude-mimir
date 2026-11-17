@@ -390,6 +390,10 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ri.finish()
 			return
 		}
+		if model == jevModel {
+			g.serveJev(w, r, ri, src)
+			return
+		}
 		if g.cfg.mimirAPI == "openai" {
 			ri.rec["mimir_api"] = "openai"
 			ri.replay = g.cfg.replay[model] != nil

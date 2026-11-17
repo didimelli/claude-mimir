@@ -6,9 +6,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
 	"strings"
+	"time"
 )
 
 const jevModel = "cubbit/mimir-jev"
@@ -141,4 +145,100 @@ func jevReply(model string, pYes, pNo, confidence float64, stream bool) []byte {
 		"content":          []any{map[string]any{"type": "text", "text": string(line)}},
 		"stop_reason":      "end_turn", "stop_sequence": nil, "usage": usage,
 	})
+}
+
+// ---- the gateway branch --------------------------------------------------------------------------------------
+
+// serveJev answers one cubbit/mimir-jev request itself: one SystemOne call, one reply, one log line. It never
+// retries; a failed call is classified here, at the handler, per the repo's error-handling rules.
+func (g *gateway) serveJev(w http.ResponseWriter, r *http.Request, ri *reqInfo, src []byte) {
+	ri.ctx = r.Context() // everything below checks client cancellation through reqInfo
+	if g.cfg.mimirAPI != "openai" {
+		ri.status, ri.errMsg = http.StatusBadRequest, "jev needs the openai Mimir API"
+		writeError(w, http.StatusBadRequest, "router: cubbit/mimir-jev needs the openai Mimir API (MIMIR_API=openai)")
+		ri.finish()
+		return
+	}
+	question, state, err := toSystemOne(src)
+	if err != nil {
+		ri.status, ri.errMsg = http.StatusBadRequest, err.Error()
+		writeError(w, http.StatusBadRequest, "router: cubbit/mimir-jev needs a text question in the last user message: "+err.Error())
+		ri.finish()
+		return
+	}
+	var req struct {
+		Stream bool `json:"stream"`
+	}
+	_ = json.Unmarshal(src, &req)
+	call := marshal(map[string]any{
+		"state": map[string]string{"text": state},
+		"questions": map[string]any{"q": map[string]any{
+			"type": "noul",
+			"criteria": map[string]any{
+				"true":  map[string]string{"text": question},
+				"false": nil,
+			},
+		}},
+	})
+	hreq, err := http.NewRequestWithContext(r.Context(), http.MethodPost,
+		strings.TrimRight(g.mimirU.String(), "/")+"/systemone", bytes.NewReader(call))
+	if err != nil { // unreachable: the endpoint passed parseConfig
+		ri.status, ri.errMsg = http.StatusInternalServerError, err.Error()
+		writeError(w, http.StatusInternalServerError, "router: bad Mimir endpoint: "+err.Error())
+		ri.finish()
+		return
+	}
+	hreq.Header.Set("Content-Type", "application/json")
+	hreq.Header.Set("Authorization", "Bearer "+g.cfg.mimirKey)
+	resp, err := (&http.Client{Transport: g.transport, Timeout: 30 * time.Second}).Do(hreq)
+	if err != nil {
+		if errors.Is(err, context.Canceled) { // the client is gone; writing to the ResponseWriter is wasted
+			ri.errMsg = "client went away"
+			ri.finish()
+			return
+		}
+		g.jevFail(w, ri, http.StatusBadGateway, "SystemOne is unreachable: "+err.Error())
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	payload, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode/100 != 2 {
+		g.jevFailStatus(w, ri, resp.StatusCode, payload)
+		return
+	}
+	pYes, pNo, conf, err := parseSystemOne(payload)
+	if err != nil {
+		g.jevFail(w, ri, http.StatusBadGateway, "could not read the SystemOne reply: "+err.Error())
+		return
+	}
+	verdict := "no"
+	if pYes >= 0.5 {
+		verdict = "yes"
+	}
+	ri.rec["jev_verdict"], ri.rec["jev_p_yes"], ri.rec["jev_confidence"] = verdict, pYes, conf
+	ri.status = http.StatusOK
+	if req.Stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+	}
+	body := &countingBody{rc: io.NopCloser(bytes.NewReader(jevReply(jevModel, pYes, pNo, conf, req.Stream))), ri: ri}
+	_, _ = io.Copy(w, body)
+	_ = body.Close() // closes the log line, as on the proxied legs
+}
+
+// jevFailStatus translates an upstream error into a sanitized Anthropic error; the raw payload never reaches
+// the client, and only the translated status plus the upstream's message are logged.
+func (g *gateway) jevFailStatus(w http.ResponseWriter, ri *reqInfo, status int, payload []byte) {
+	st, eb := translateOpenAIError(status, payload)
+	ri.status, ri.errMsg = st, errorText(payload)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(st)
+	_, _ = w.Write(eb)
+	ri.finish()
+}
+
+func (g *gateway) jevFail(w http.ResponseWriter, ri *reqInfo, status int, msg string) {
+	g.jevFailStatus(w, ri, status, marshal(map[string]any{"error": map[string]string{"message": msg}}))
 }
