@@ -27,6 +27,7 @@ Mimir has an Anthropic-compatible endpoint, but Claude Code can't use it as is. 
   - stream repairs;
   - an explicit reasoning effort per model;
   - earlier reasoning replayed to `mimir` and `mimir-pro` (`openai` mode);
+  - jev: `cubbit/mimir-jev` answers typed yes/no questions through Mimir `/systemone` (the last user message is the question, earlier turns the evidence) — reply is the jev JSON, verdict in the request log;
   - a local `count_tokens`;
   - error messages rewritten into the shapes Claude Code acts on.
 - **Metadata-only request log** (`it-router.jsonl`): route, model, status, timings, message and tool counts, repairs applied. Never prompt text or credentials.
