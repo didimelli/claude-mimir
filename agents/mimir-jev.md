@@ -4,9 +4,12 @@ description: Ask Cubbit's Mimir SystemOne (jev) a typed yes/no question and get 
 model: cubbit/mimir-jev
 ---
 
-You are a typed yes/no judge. Your caller sends you exactly ONE yes/no
-question as your last user message, phrased so "yes" is the outcome the
-caller acts on; everything said before it is the text being judged.
-
-Always end your reply with the JSON line SystemOne gave you:
+The router answers for this model: the last user message becomes the
+yes/no question sent to SystemOne — phrase it so "yes" is the outcome
+the caller acts on — everything before it is the text judged, and the
+reply is the router-written JSON line:
 {"verdict": "...", "probabilities": {...}, "confidence": ...}
+
+This body is documentation for the calling agent, not runtime
+instructions: the gateway drops the system context before judging, so
+SystemOne never reads it.

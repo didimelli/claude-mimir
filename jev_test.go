@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // ---- toSystemOne: question and state extracted from a Messages request ---------------------------------------
@@ -24,7 +25,7 @@ func TestToSystemOneQuestionFromLastUserMessage(t *testing.T) {
 			]}
 		]
 	}`)
-	question, state, err := toSystemOne(body)
+	question, state, _, err := toSystemOne(body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +44,7 @@ func TestToSystemOneQuestionFromLastUserMessage(t *testing.T) {
 }
 
 func TestToSystemOneDoubtFallback(t *testing.T) {
-	question, state, err := toSystemOne([]byte(`{"messages": [{"role": "user", "content": "The Earth is flat."}]}`))
+	question, state, _, err := toSystemOne([]byte(`{"messages": [{"role": "user", "content": "The Earth is flat."}]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +63,7 @@ func TestToSystemOneToolResultIsEvidence(t *testing.T) {
 			{"role": "user", "content": "did the job fail?"}
 		]
 	}`)
-	question, state, err := toSystemOne(body)
+	question, state, _, err := toSystemOne(body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +84,7 @@ func TestToSystemOneRejectsEmptyQuestion(t *testing.T) {
 			]}
 		]
 	}`)
-	question, _, err := toSystemOne(body)
+	question, _, _, err := toSystemOne(body)
 	if err == nil {
 		t.Fatal("an image-only question turn must be rejected")
 	}
@@ -293,6 +294,46 @@ func TestGatewayJevUpstreamErrorIsTranslated(t *testing.T) {
 	}
 }
 
+func TestGatewayJevTimeoutIs504AndSanitized(t *testing.T) {
+	old := jevTimeout
+	jevTimeout = 150 * time.Millisecond
+	t.Cleanup(func() { jevTimeout = old })
+	r := newOpenAIRig(t, func(w http.ResponseWriter, _ *http.Request) { time.Sleep(time.Second) })
+	resp, b := r.post(t, "/v1/messages", jevConvo(false))
+	if resp.StatusCode != 504 {
+		t.Fatalf("%d %s", resp.StatusCode, b)
+	}
+	if e := jevText(t, b); e["error"].(map[string]any)["type"] != "api_error" {
+		t.Fatalf("%s", b)
+	}
+	if strings.Contains(string(b), r.mimir.URL) || strings.Contains(string(b), "127.0.0.1") {
+		t.Fatalf("the client saw the endpoint: %s", b)
+	}
+	lg := r.logs(t)
+	if len(lg) != 1 || lg[0]["status"] != 504.0 || lg[0]["error"] == nil {
+		t.Fatalf("log %v", lg)
+	}
+}
+
+func TestGatewayJevLogsTrailingTurns(t *testing.T) {
+	r := newOpenAIRig(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(systemOneAnswer))
+	})
+	body := []byte(`{"model":"cubbit/mimir-jev","max_tokens":10,"stream":false,"messages":[
+		{"role":"assistant","content":"evidence"},
+		{"role":"user","content":"is it green?"},
+		{"role":"assistant","content":"prefill"}
+	]}`)
+	resp, b := r.post(t, "/v1/messages", body)
+	if resp.StatusCode != 200 || strings.Contains(string(b), "prefill") {
+		t.Fatalf("%d %s", resp.StatusCode, b)
+	}
+	lg := r.logs(t)
+	if len(lg) != 1 || lg[0]["jev_trailing_turns"] != 1.0 {
+		t.Fatalf("log %v", lg)
+	}
+}
+
 func TestGatewayJevBadAnswerIs502(t *testing.T) {
 	r := newOpenAIRig(t, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{}`))
@@ -344,7 +385,7 @@ func TestToSystemOneDropsReminderBlocks(t *testing.T) {
 			]}
 		]
 	}`)
-	question, state, err := toSystemOne(body)
+	question, state, _, err := toSystemOne(body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -353,6 +394,30 @@ func TestToSystemOneDropsReminderBlocks(t *testing.T) {
 	}
 	if state != "user: earlier" {
 		t.Errorf("state %q", state)
+	}
+}
+
+func TestToSystemOneRejectsMalformedMessage(t *testing.T) {
+	_, _, _, err := toSystemOne([]byte(`{"messages": [{"role": "user", "content": "fine"}, "oops"]}`))
+	if err == nil {
+		t.Fatal("a malformed message must be an error, not a silent skip")
+	}
+}
+
+func TestToSystemOneReportsTrailingTurns(t *testing.T) {
+	body := []byte(`{
+		"messages": [
+			{"role": "user", "content": "earlier"},
+			{"role": "user", "content": "is it green?"},
+			{"role": "assistant", "content": "a prefill turn"}
+		]
+	}`)
+	question, state, trailing, err := toSystemOne(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if question != "is it green?" || state != "user: earlier" || trailing != 1 {
+		t.Errorf("question %q state %q trailing %d", question, state, trailing)
 	}
 }
 

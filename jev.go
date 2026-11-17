@@ -9,13 +9,25 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
 )
 
 const jevModel = "cubbit/mimir-jev"
+
+var jevTimeout = 30 * time.Second
+
+// jevVerdict is the one place the decision rule lives: P(yes) >= 0.5 -> "yes"; the reply and the log share it.
+func jevVerdict(pYes float64) string {
+	if pYes >= 0.5 {
+		return "yes"
+	}
+	return "no"
+}
 
 // isReminder reports a text that is entirely a Claude Code system-reminder wrapper. The harness injects them
 // into user turns (CLAUDE.md, hooks output, attached context); judging them as the question or as evidence would
@@ -25,21 +37,22 @@ func isReminder(s string) bool {
 	return strings.HasPrefix(t, reminderOpen) && strings.HasSuffix(t, "</system-reminder>")
 }
 
-// toSystemOne pulls the (question, state) pair out of a Messages request. The system prompt is never
-// judged on: it is Claude Code boilerplate, and jev's calibration dilutes fast.
-func toSystemOne(body []byte) (question, state string, err error) {
+// toSystemOne pulls the (question, state, trailing) triple out of a Messages request. The system prompt is
+// never judged on: it is Claude Code boilerplate, and jev's calibration dilutes fast.
+func toSystemOne(body []byte) (question, state string, trailing int, err error) {
 	var req struct {
 		Messages []json.RawMessage `json:"messages"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
-		return "", "", err
+		return "", "", 0, err
 	}
 	msgs := make([]msg, 0, len(req.Messages))
 	for _, raw := range req.Messages {
 		var m msg
-		if json.Unmarshal(raw, &m) == nil {
-			msgs = append(msgs, m)
+		if err := json.Unmarshal(raw, &m); err != nil {
+			return "", "", 0, fmt.Errorf("a message could not be read: %w", err)
 		}
+		msgs = append(msgs, m)
 	}
 	last := -1
 	for i, m := range msgs {
@@ -48,8 +61,9 @@ func toSystemOne(body []byte) (question, state string, err error) {
 		}
 	}
 	if last < 0 {
-		return "", "", errors.New("no user message to ask a question of")
+		return "", "", 0, errors.New("no user message to ask a question of")
 	}
+	trailing = len(msgs) - 1 - last // prefill turn and anything else after the question
 	var qs []string
 	for _, b := range blocksOfContent(msgs[last]["content"]) {
 		if b.Type == "text" && b.Text != "" && !isReminder(b.Text) {
@@ -78,12 +92,12 @@ func toSystemOne(body []byte) (question, state string, err error) {
 	}
 	state = strings.Join(ev, "\n\n")
 	if question == "" {
-		return "", "", errors.New("the last user message has no text to ask")
+		return "", "", 0, errors.New("the last user message has no text to ask")
 	}
 	if state == "" { // a fresh single-message conversation: the claim is judged on its own
 		state = question
 	}
-	return question, state, nil
+	return question, state, trailing, nil
 }
 
 // ---- replies -------------------------------------------------------------------------------------------------
@@ -124,12 +138,8 @@ func jevEvent(b *bytes.Buffer, name string, data any) {
 // jevReply builds the whole response body: the jev JSON line as one text block, as a Messages object or as a
 // synthesized SSE stream with the house event shapes. Usage is zero: SystemOne reports no tokens.
 func jevReply(model string, pYes, pNo, confidence float64, stream bool) []byte {
-	verdict := "no"
-	if pYes >= 0.5 {
-		verdict = "yes"
-	}
 	line := marshal(map[string]any{
-		"verdict": verdict, "probabilities": map[string]float64{"yes": pYes, "no": pNo}, "confidence": confidence,
+		"verdict": jevVerdict(pYes), "probabilities": map[string]float64{"yes": pYes, "no": pNo}, "confidence": confidence,
 	})
 	usage := map[string]int{"input_tokens": 0, "output_tokens": 0}
 	if stream {
@@ -167,12 +177,15 @@ func (g *gateway) serveJev(w http.ResponseWriter, r *http.Request, ri *reqInfo, 
 		ri.finish()
 		return
 	}
-	question, state, err := toSystemOne(src)
+	question, state, trailing, err := toSystemOne(src)
 	if err != nil {
 		ri.status, ri.errMsg = http.StatusBadRequest, err.Error()
 		writeError(w, http.StatusBadRequest, "router: cubbit/mimir-jev needs a text question in the last user message: "+err.Error())
 		ri.finish()
 		return
+	}
+	if trailing > 0 {
+		ri.rec["jev_trailing_turns"] = trailing
 	}
 	var req struct {
 		Stream bool `json:"stream"`
@@ -198,11 +211,20 @@ func (g *gateway) serveJev(w http.ResponseWriter, r *http.Request, ri *reqInfo, 
 	}
 	hreq.Header.Set("Content-Type", "application/json")
 	hreq.Header.Set("Authorization", "Bearer "+g.cfg.mimirKey)
-	resp, err := (&http.Client{Transport: g.transport, Timeout: 30 * time.Second}).Do(hreq)
+	resp, err := (&http.Client{Transport: g.transport, Timeout: jevTimeout}).Do(hreq)
 	if err != nil {
 		if errors.Is(err, context.Canceled) { // the client is gone; writing to the ResponseWriter is wasted
 			ri.errMsg = "client went away"
 			ri.finish()
+			return
+		}
+		var ne net.Error
+		if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout()) {
+			ri.errMsg = err.Error() // the full cause, endpoint included, stays in the log
+			st, eb := translateOpenAIError(http.StatusGatewayTimeout, marshal(map[string]any{
+				"error": map[string]string{"message": "Mimir's SystemOne did not answer in " + jevTimeout.String()},
+			}))
+			g.jevRespond(w, ri, st, eb, ri.errMsg)
 			return
 		}
 		g.jevFail(w, ri, http.StatusBadGateway, "SystemOne is unreachable: "+err.Error())
@@ -219,11 +241,7 @@ func (g *gateway) serveJev(w http.ResponseWriter, r *http.Request, ri *reqInfo, 
 		g.jevFail(w, ri, http.StatusBadGateway, "could not read the SystemOne reply: "+err.Error())
 		return
 	}
-	verdict := "no"
-	if pYes >= 0.5 {
-		verdict = "yes"
-	}
-	ri.rec["jev_verdict"], ri.rec["jev_p_yes"], ri.rec["jev_confidence"] = verdict, pYes, conf
+	ri.rec["jev_verdict"], ri.rec["jev_p_yes"], ri.rec["jev_confidence"] = jevVerdict(pYes), pYes, conf
 	ri.status = http.StatusOK
 	if req.Stream {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -236,17 +254,23 @@ func (g *gateway) serveJev(w http.ResponseWriter, r *http.Request, ri *reqInfo, 
 	_ = body.Close() // closes the log line, as on the proxied legs
 }
 
-// jevFailStatus translates an upstream error into a sanitized Anthropic error; the raw payload never reaches
-// the client, and only the translated status plus the upstream's message are logged.
-func (g *gateway) jevFailStatus(w http.ResponseWriter, ri *reqInfo, status int, payload []byte) {
-	st, eb := translateOpenAIError(status, payload)
-	ri.status, ri.errMsg = st, errorMessage(eb, "") // structured and bounded, exactly like the proxied legs
+// jevRespond writes an error body we translated ourselves and closes the log line with logMsg.
+func (g *gateway) jevRespond(w http.ResponseWriter, ri *reqInfo, st int, eb []byte, logMsg string) {
+	ri.status, ri.errMsg = st, logMsg
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(st)
 	_, _ = w.Write(eb)
 	ri.finish()
 }
 
+// jevFailStatus translates an upstream error into a sanitized Anthropic error; the raw payload never reaches
+// the client, and only the translated status plus the upstream's message are logged.
+func (g *gateway) jevFailStatus(w http.ResponseWriter, ri *reqInfo, status int, payload []byte) {
+	st, eb := translateOpenAIError(status, payload)
+	g.jevRespond(w, ri, st, eb, errorMessage(eb, "")) // structured and bounded, exactly like the proxied legs
+}
+
 func (g *gateway) jevFail(w http.ResponseWriter, ri *reqInfo, status int, msg string) {
-	g.jevFailStatus(w, ri, status, marshal(map[string]any{"error": map[string]string{"message": msg}}))
+	st, eb := translateOpenAIError(status, marshal(map[string]any{"error": map[string]string{"message": msg}}))
+	g.jevRespond(w, ri, st, eb, msg)
 }
