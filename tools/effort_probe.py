@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Measure how much Mimir Pro reasons under different reasoning controls, straight against Mimir's /anthropic endpoint.
 
-Usage: MIMIR_API_KEY=... MIMIR_ANTHROPIC_URL=... effort_probe.py OUT.jsonl RUNS VARIANT...   (variants: none, disabled, low, medium, high, budget2k, budget8k)
+Usage: MIMIR_API_KEY=... MIMIR_ANTHROPIC_URL=... [PROBE_URL=...] [PROBE_MODEL=cubbit/mimir-pro] effort_probe.py OUT.jsonl RUNS VARIANT...   (variants: none, disabled, low, medium, high, budget2k, budget8k)
 Writes one JSON line per run: variant, seconds, thinking events/chars (any block), text chars, tool calls, stop reason, status.
 """
 import concurrent.futures as cf
@@ -14,6 +14,7 @@ import urllib.request
 # Where to send the requests: the gateway (http://127.0.0.1:4000/v1/messages) or Mimir directly
 # ($MIMIR_ANTHROPIC_URL/v1/messages, which is the default).
 URL = os.environ.get("PROBE_URL") or os.environ["MIMIR_ANTHROPIC_URL"].rstrip("/") + "/v1/messages"
+MODEL = os.environ.get("PROBE_MODEL", "cubbit/mimir-pro")
 PROMPT = ("A warehouse has 7 robots on a 6x6 grid. Each robot moves one cell per tick, never onto a cell another robot "
           "occupies at that tick, and robots may not swap places. Robots start at (0,0),(0,5),(5,0),(5,5),(2,2),(3,3),(2,3) "
           "and must reach (5,5),(5,0),(0,5),(0,0),(3,3),(2,2),(3,2) respectively. Find the minimum number of ticks and give "
@@ -32,7 +33,7 @@ VARIANTS = {
 
 
 def run(variant: str) -> dict:
-    body = {"model": "cubbit/mimir-pro", "max_tokens": 32000, "stream": True, "tools": TOOLS,
+    body = {"model": MODEL, "max_tokens": 32000, "stream": True, "tools": TOOLS,
             "messages": [{"role": "user", "content": PROMPT}], **VARIANTS[variant]}
     req = urllib.request.Request(URL, data=json.dumps(body).encode(), method="POST", headers={
         "x-api-key": os.environ["MIMIR_API_KEY"], "content-type": "application/json", "anthropic-version": "2023-06-01"})
